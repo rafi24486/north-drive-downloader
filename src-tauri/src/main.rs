@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod guest;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use rand::RngCore;
 use reqwest::{header, Client, StatusCode};
@@ -12,21 +13,33 @@ use tokio::{fs as async_fs, io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener,
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
 const DRIVE_BASE: &str = "https://www.googleapis.com/drive/v3/files";
-const SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
+const SCOPE: &str = "openid email profile https://www.googleapis.com/auth/drive.readonly";
+const GOOGLE_USERINFO_URL: &str = "https://openidconnect.googleapis.com/v1/userinfo";
 const KEYCHAIN_SERVICE: &str = "com.northdrive.downloader.oauth";
+// The publisher's Desktop OAuth client ID is public by design; never embed a client secret.
+const BUNDLED_GOOGLE_CLIENT_ID: Option<&str> = option_env!("NORTH_GOOGLE_CLIENT_ID");
+fn oauth_client_id() -> &'static str {
+    BUNDLED_GOOGLE_CLIENT_ID.filter(|s| !s.trim().is_empty()).unwrap_or("")
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Preferences {
-    api_key: String,
-    client_id: String,
     save_directory: String,
     max_parallel: usize,
 }
 impl Default for Preferences {
     fn default() -> Self {
-        Self { api_key: String::new(), client_id: String::new(), save_directory: String::new(), max_parallel: 4 }
+        Self { save_directory: String::new(), max_parallel: 4 }
     }
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GoogleProfile {
+    // Google sub is immutable for this account + app. Never use name/picture as an identity key.
+    sub: String,
+    name: Option<String>,
+    email: Option<String>,
+    picture: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,9 +160,15 @@ fn get_preferences(state: State<'_, Arc<AppState>>) -> Preferences { state.prefs
 #[tauri::command]
 fn is_connected() -> bool { has_login() }
 #[tauri::command]
+fn get_auth_config() -> serde_json::Value {
+    serde_json::json!({
+        "managedOAuthConfigured": BUNDLED_GOOGLE_CLIENT_ID.is_some_and(|id| !id.trim().is_empty())
+    })
+}
+#[tauri::command]
 fn set_preferences(app: AppHandle, state: State<'_, Arc<AppState>>, preferences: Preferences) -> Result<(), String> {
     if preferences.max_parallel == 0 || preferences.max_parallel > 8 { return Err("Parallel downloads must be between 1 and 8".into()); }
-    let preferences = Preferences { api_key: preferences.api_key.trim().to_string(), client_id: preferences.client_id.trim().to_string(), save_directory: preferences.save_directory.trim().to_string(), max_parallel: preferences.max_parallel };
+    let preferences = Preferences { save_directory: preferences.save_directory.trim().to_string(), max_parallel: preferences.max_parallel };
     persist_prefs(&app, &preferences)?;
     *state.prefs.lock().unwrap() = preferences;
     Ok(())
@@ -168,9 +187,9 @@ fn new_verifier() -> (String, String, String) {
 }
 
 #[tauri::command]
-async fn connect_google(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    let client_id = state.prefs.lock().unwrap().client_id.clone();
-    if client_id.is_empty() { return Err("Add your Google OAuth Desktop Client ID in Settings first".into()); }
+async fn connect_google(state: State<'_, Arc<AppState>>) -> Result<GoogleProfile, String> {
+    let client_id = oauth_client_id();
+    if client_id.is_empty() { return Err("Google sign-in is not configured for this build. Contact the North Drive publisher.".into()); }
     let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
     let port = listener.local_addr().map_err(|e| e.to_string())?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
@@ -208,27 +227,98 @@ async fn connect_google(state: State<'_, Arc<AppState>>) -> Result<String, Strin
             if let Some(error) = params.get("error") { return Err(format!("Google authorization denied: {error}")); }
             return params.get("code").cloned().ok_or_else(|| "Missing authorization code".to_string());
         }
-    }).await.map_err(|_| "Google sign-in timed out".to_string())??;
+    }).await.map_err(|_| "Google sign-in did not complete. If Google showed Access blocked, check your OAuth Test users and Desktop client setup.".to_string())??;
     let response = state.client.post("https://oauth2.googleapis.com/token").form(&[
-        ("code", code.as_str()), ("client_id", client_id.as_str()), ("code_verifier", verifier.as_str()),
+        ("code", code.as_str()), ("client_id", client_id), ("code_verifier", verifier.as_str()),
         ("redirect_uri", redirect_uri.as_str()), ("grant_type", "authorization_code")
     ]).send().await.map_err(|e| e.to_string())?;
-    if !response.status().is_success() { return Err(format!("Google sign-in failed: {}", response.text().await.unwrap_or_default())); }
+    if !response.status().is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        return Err(oauth_failure_text(&detail));
+    }
     let token: OAuthToken = response.json().await.map_err(|e| e.to_string())?;
     let refresh = token.refresh_token.ok_or("Google did not return a refresh token; revoke access and retry")?;
+    let profile = fetch_google_profile(&state.client, &token.access_token).await?;
+    ensure_google_drive_enabled(&state.client, &token.access_token).await?;
     keychain_entry()?.set_password(&refresh).map_err(|e| e.to_string())?;
-    Ok("Google account connected".into())
+    Ok(profile)
 }
 
-async fn refresh_access_token(client: &Client, prefs: &Preferences) -> Result<String, String> {
-    if prefs.client_id.is_empty() { return Err("OAuth Client ID not configured".into()); }
+async fn refresh_access_token(client: &Client, _prefs: &Preferences) -> Result<String, String> {
+    let client_id = oauth_client_id();
+    if client_id.is_empty() { return Err("Google sign-in is not configured in this build. Contact the publisher".into()); }
     let refresh = keychain_entry()?.get_password().map_err(|_| "Google account not connected. Go to Accounts and sign in".to_string())?;
     let response = client.post("https://oauth2.googleapis.com/token").form(&[
-        ("client_id", prefs.client_id.as_str()), ("refresh_token", refresh.as_str()), ("grant_type", "refresh_token")
+        ("client_id", client_id), ("refresh_token", refresh.as_str()), ("grant_type", "refresh_token")
     ]).send().await.map_err(|e| e.to_string())?;
-    if !response.status().is_success() { return Err("Google session expired or was revoked. Reconnect your account".into()); }
+    if !response.status().is_success() {
+        let detail = response.text().await.unwrap_or_default();
+        let code = serde_json::from_str::<serde_json::Value>(&detail).ok()
+            .and_then(|v| v.get("error").and_then(|s| s.as_str()).map(str::to_owned))
+            .unwrap_or_else(|| "unknown".into());
+        return Err(format!("Google session is invalid ({code}). Reconnect your Google account."));
+    }
     let token: OAuthToken = response.json().await.map_err(|e| e.to_string())?;
     Ok(token.access_token)
+}
+
+async fn ensure_google_drive_enabled(client: &Client, token: &str) -> Result<(), String> {
+    // A tiny live API probe: validates that the publisher's Google Cloud project
+    // has enabled Drive API and that Drive read scope was actually granted.
+    let response = client.get(DRIVE_BASE)
+        .bearer_auth(token)
+        .query(&[("pageSize", "1"), ("fields", "files(id)")])
+        .timeout(Duration::from_secs(20))
+        .send().await.map_err(|e| format!("Could not reach Google Drive API: {e}"))?;
+    if response.status().is_success() { return Ok(()); }
+    let status = response.status().as_u16();
+    let body = response.text().await.unwrap_or_default();
+    let text = body.to_lowercase();
+    if text.contains("has not been used") || text.contains("api is disabled")
+        || text.contains("accessnotconfigured") || text.contains("service_disabled") {
+        return Err("Google Drive API is disabled in the publisher's Google Cloud project. Enable it in APIs & Services, then try again.".into());
+    }
+    if status == 401 { return Err("Google Drive rejected the sign-in token. Disconnect and sign in again.".into()); }
+    if status == 403 && (text.contains("insufficient") || text.contains("scope")) {
+        return Err("Google Drive read permission was not granted. Sign in again and approve Drive access.".into());
+    }
+    let message = serde_json::from_str::<serde_json::Value>(&body).ok()
+        .and_then(|v| v.pointer("/error/message").and_then(|s| s.as_str()).map(str::to_owned))
+        .unwrap_or_else(|| format!("HTTP {status}"));
+    Err(format!("Google Drive check failed: {}", message.chars().take(190).collect::<String>()))
+}
+
+fn oauth_failure_text(body: &str) -> String {
+    let value = serde_json::from_str::<serde_json::Value>(body).ok();
+    let code = value.as_ref().and_then(|v| v.get("error")).and_then(|v| v.as_str()).unwrap_or("unknown");
+    match code {
+        "invalid_client" => "Google rejected North Drive's OAuth client. Confirm the client ID is a Desktop app OAuth client in the correct Google Cloud project.".into(),
+        "unauthorized_client" | "redirect_uri_mismatch" => "Google rejected this desktop sign-in redirect. Check the Google OAuth client's type is Desktop app.".into(),
+        "access_denied" => "Google denied access. If the app is in Testing, add your Gmail under Google Auth Platform > Audience > Test users.".into(),
+        "invalid_grant" => "The Google sign-in code expired or was already used. Try connecting again.".into(),
+        _ => format!("Google OAuth failed ({code}). Check Google Cloud authentication settings.")
+    }
+}
+
+async fn fetch_google_profile(client: &Client, access_token: &str) -> Result<GoogleProfile, String> {
+    let response = client.get(GOOGLE_USERINFO_URL)
+        .bearer_auth(access_token)
+        .send().await.map_err(|e| format!("Could not load Google profile: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("Google profile request failed (HTTP {}). Please reconnect.", response.status()));
+    }
+    let profile: GoogleProfile = response.json().await.map_err(|e| format!("Invalid Google profile: {e}"))?;
+    if profile.sub.trim().is_empty() { return Err("Google did not provide a valid account identifier".into()); }
+    Ok(profile)
+}
+
+#[tauri::command]
+async fn get_google_profile(state: State<'_, Arc<AppState>>) -> Result<GoogleProfile, String> {
+    let prefs = state.prefs.lock().unwrap().clone();
+    let token = refresh_access_token(&state.client, &prefs).await?;
+    let profile = fetch_google_profile(&state.client, &token).await?;
+    ensure_google_drive_enabled(&state.client, &token).await?;
+    Ok(profile)
 }
 
 fn parse_drive_link(link: &str) -> Result<(String, Option<String>), String> {
@@ -284,22 +374,13 @@ async fn metadata(client: &Client, access: &Access, id: &str, keys: &HashMap<Str
     ], keys).await
 }
 async fn resolve_access(client: &Client, prefs: &Preferences, id: &str, rk: &Option<String>) -> Result<(Access, DriveFile), String> {
-    let mut keys = HashMap::new(); if let Some(k) = rk { keys.insert(id.to_string(), k.clone()); }
-    let mut public_err = String::new();
-    if !prefs.api_key.is_empty() {
-        let public = Access::Public(prefs.api_key.clone());
-        match metadata(client, &public, id, &keys).await {
-            Ok(meta) => return Ok((public,meta)), Err(err) => public_err = err
-        }
-    }
-    if has_login() {
-        let oauth = Access::OAuth(refresh_access_token(client, prefs).await?);
-        let meta = metadata(client, &oauth, id, &keys).await?;
-        return Ok((oauth, meta));
-    }
-    Err(if prefs.api_key.is_empty() {
-        "Configure a Google Drive API key for public links, or connect your Google account for restricted links".into()
-    } else { format!("Public access failed: {public_err}. If this is restricted, connect an authorized Google account") })
+    if !has_login() { return Err("Connect your Google account first to open Drive folder links".into()); }
+    let mut keys = HashMap::new();
+    if let Some(k) = rk { keys.insert(id.to_string(), k.clone()); }
+    let oauth = Access::OAuth(refresh_access_token(client, prefs).await?);
+    let meta = metadata(client, &oauth, id, &keys).await
+        .map_err(|e| format!("Unable to access this folder with your connected Google account: {e}"))?;
+    Ok((oauth, meta))
 }
 fn workspace_export(mime: &str) -> Option<(&'static str, &'static str)> {
     match mime {
@@ -312,70 +393,8 @@ fn workspace_export(mime: &str) -> Option<(&'static str, &'static str)> {
 }
 
 #[tauri::command]
-async fn scan_folder(link: String, state: State<'_, Arc<AppState>>) -> Result<FolderPlan, String> {
-    let prefs = state.prefs.lock().unwrap().clone();
-    let (id, rk) = parse_drive_link(&link)?;
-    let client = &state.client;
-    let (access, root) = resolve_access(client, &prefs, &id, &rk).await?;
-    if root.mime_type != FOLDER_MIME { return Err("The shared link is not a folder".into()); }
-    let mut queue: VecDeque<(String, String)> = VecDeque::from([(id.clone(), String::new())]);
-    let mut keys = HashMap::new();
-    if let Some(k) = rk.clone().or(root.resource_key.clone()) { keys.insert(id.clone(), k); }
-    let mut seen_folders: HashSet<String> = std::iter::once(id.clone()).collect();
-    let mut files = Vec::new(); let mut empty_folders = Vec::new(); let mut warnings = Vec::new();
-    let mut total_bytes = 0u64;
-    while let Some((folder_id, parent_path)) = queue.pop_front() {
-        let mut found_children = false;
-        let mut page: Option<String> = None;
-        let mut occupied = HashSet::new();
-        loop {
-            let mut params = vec![
-                ("q", format!("'{}' in parents and trashed = false", folder_id)),
-                ("pageSize", "1000".into()),
-                ("fields", "nextPageToken,files(id,name,mimeType,size,md5Checksum,resourceKey,capabilities(canDownload))".into()),
-                ("supportsAllDrives", "true".into()),
-                ("includeItemsFromAllDrives", "true".into()),
-            ];
-            if let Some(ref token) = page { params.push(("pageToken", token.clone())); }
-            let mut request_keys = HashMap::new();
-            if let Some(k) = keys.get(&id) { request_keys.insert(id.clone(), k.clone()); }
-            if let Some(k) = keys.get(&folder_id) { request_keys.insert(folder_id.clone(), k.clone()); }
-            let result: FilePage = json_request(client, &access, DRIVE_BASE, &params, &request_keys).await?;
-            for entry in result.files {
-                found_children = true;
-                if let Some(k) = &entry.resource_key { keys.insert(entry.id.clone(), k.clone()); }
-                let export = workspace_export(&entry.mime_type);
-                let base_name = sanitized_name(&entry.name);
-                let filename = if let Some((_,suffix)) = export { format!("{base_name}{suffix}") } else { base_name };
-                let final_name = unique_name(&filename, &mut occupied);
-                let relative_path = if parent_path.is_empty() { final_name.clone() } else { format!("{parent_path}/{final_name}") };
-                if entry.mime_type == FOLDER_MIME {
-                    if seen_folders.insert(entry.id.clone()) { queue.push_back((entry.id, relative_path)); }
-                    continue;
-                }
-                if entry.mime_type == SHORTCUT_MIME {
-                    warnings.push(format!("Shortcut not copied: {relative_path}"));
-                    continue;
-                }
-                if entry.capabilities.as_ref().and_then(|x| x.can_download) == Some(false) {
-                    warnings.push(format!("Download disabled by owner: {relative_path}"));
-                    continue;
-                }
-                if entry.mime_type.starts_with("application/vnd.google-apps.") && export.is_none() {
-                    warnings.push(format!("Unsupported Google Workspace file: {relative_path}"));
-                    continue;
-                }
-                let file_path = relative_path;
-                let size = entry.size.and_then(|v| v.parse::<u64>().ok());
-                total_bytes = total_bytes.saturating_add(size.unwrap_or_default());
-                files.push(DownloadItem { id: entry.id, name: final_name, relative_path: file_path, size, mime_type: entry.mime_type, md5_checksum: entry.md5_checksum, resource_key: entry.resource_key, export_mime: export.map(|(m,_)| m.into()) });
-            }
-            page = result.next_page_token;
-            if page.is_none() { break; }
-        }
-        if !found_children && !parent_path.is_empty() { empty_folders.push(parent_path); }
-    }
-    Ok(FolderPlan { folder_id: id, folder_name: sanitized_name(&root.name), files, empty_folders, total_bytes, warnings, access_method: access.method().into(), folder_resource_key: rk.or(root.resource_key) })
+async fn scan_folder(link: String) -> Result<FolderPlan, String> {
+    guest::scan_folder(&link).await
 }
 
 fn safe_relative(raw: &str) -> Result<PathBuf, String> {
@@ -535,7 +554,7 @@ async fn start_download(app: AppHandle, state: State<'_, Arc<AppState>>, plan: F
     let client = state.client.clone(); let app_handle = app.clone();
     let state_handle = state.inner().clone();
     tauri::async_runtime::spawn(async move {
-        let result = download_folder(&app_handle, &client, &prefs, &plan, &destination, &run).await;
+        let result = guest::download_folder(&app_handle, &plan, &destination, &run).await;
         let _ = app_handle.emit("north:summary", result);
         let mut active = state_handle.run.lock().unwrap();
         if active.as_ref().is_some_and(|existing| Arc::ptr_eq(existing, &run)) { *active = None; }
@@ -552,8 +571,10 @@ async fn download_folder(app: &AppHandle, client: &Client, prefs: &Preferences, 
             Err(e) => errors.push(e)
         }
     }
-    let access = if plan.access_method == "public" && !prefs.api_key.is_empty() { Access::Public(prefs.api_key.clone()) }
-        else { match refresh_access_token(client, prefs).await { Ok(t) => Access::OAuth(t), Err(e) => return RunSummary{completed:0,failed:plan.files.len(),cancelled:false,errors:vec![e]} } };
+    let access = match refresh_access_token(client, prefs).await {
+        Ok(token) => Access::OAuth(token),
+        Err(e) => return RunSummary { completed:0, failed:plan.files.len(), cancelled:false, errors:vec![e] }
+    };
     let auth_cache: AuthCache = Arc::new(tokio::sync::Mutex::new((Instant::now(), access)));
     let mut tasks = tokio::task::JoinSet::new();
     let mut completed = 0; let mut failed = 0;
@@ -605,7 +626,7 @@ fn main() {
             app.manage(Arc::new(AppState { prefs: Mutex::new(prefs), run: Mutex::new(None), client }));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_preferences, set_preferences, is_connected, connect_google, disconnect, scan_folder, start_download, pause_download, cancel_download])
+        .invoke_handler(tauri::generate_handler![get_preferences, set_preferences, is_connected, get_auth_config, connect_google, get_google_profile, disconnect, scan_folder, start_download, pause_download, cancel_download])
         .run(tauri::generate_context!())
         .expect("Failed to start North Drive Downloader");
 }
@@ -616,6 +637,10 @@ mod tests {
     #[test] fn parse_folder_and_key() {
         let (id,k)=parse_drive_link("https://drive.google.com/drive/u/0/folders/1aBcD_efGh1234?resourcekey=0-secret").unwrap();
         assert_eq!(id,"1aBcD_efGh1234"); assert_eq!(k.as_deref(),Some("0-secret"));
+    }
+    #[test] fn oauth_error_classification() {
+        assert!(oauth_failure_text(r#"{"error":"invalid_client"}"#).contains("Desktop"));
+        assert!(oauth_failure_text(r#"{"error":"access_denied"}"#).contains("Test users"));
     }
     #[test] fn rejects_wrong_host() {assert!(parse_drive_link("https://evil.com/drive/folders/12345678").is_err());}
     #[test] fn rejects_path_traversal() { assert!(safe_relative("../footage.mov").is_err()); assert!(safe_relative("A/B.mov").is_ok()); }

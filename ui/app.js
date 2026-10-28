@@ -36,20 +36,116 @@
   const escapeHtml = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   const formatBytes = bytes => { if (bytes === null || bytes === undefined) return '—'; if(bytes < 1024) return `${bytes} B`; const units=['KB','MB','GB','TB','PB']; let n=bytes/1024, i=0; while(n>=1024&&i<units.length-1){n/=1024;i++;} return `${n>=100?n.toFixed(0):n>=10?n.toFixed(1):n.toFixed(2)} ${units[i]}`; };
   const formatSpeed = b => b >= 1048576 ? `${(b/1048576).toFixed(1)} MB/s` : `${(b/1024).toFixed(0)} KB/s`;
-  const state = { plan: null, progress: {}, running:false, paused:false, currentFilter:'all', connected:false, activePage:'home', speedHistory:Array(40).fill(0), demo:!tauri, preferences:{apiKey:'',clientId:'',maxParallel:4,saveDirectory:''}, summary:null };
+  const state = { plan: null, progress: {}, running:false, paused:false, currentFilter:'all', connected:false, activePage:'home', speedHistory:Array(40).fill(0), demo:!tauri, preferences:{maxParallel:4,saveDirectory:''}, summary:null, managedOAuth:false, profile:null, profileError:'' };
   let toastTimer;
   function toast(text, error=false) {const el=$('#toast');el.textContent=text;el.classList.toggle('error',error);el.classList.add('show');clearTimeout(toastTimer);toastTimer=setTimeout(()=>el.classList.remove('show'),4600);}
   function goPage(page) {if(!['home','downloads','completed','accounts','settings'].includes(page))return; state.activePage=page;$$('.page').forEach(el=>el.classList.toggle('visible',el.id===`page-${page}`));$$('.nav-item').forEach(el=>el.classList.toggle('active',el.dataset.page===page));$('#crumbName').textContent=({home:'Overview',downloads:'Downloads',completed:'Completed',accounts:'Accounts',settings:'Settings'})[page];if(page==='downloads'||page==='completed')renderFiles();}
   $$('[data-page]').forEach(el=>el.addEventListener('click',()=>goPage(el.dataset.page)));
+  // macOS menu-style shortcuts; keep text-editing shortcuts untouched.
+  document.addEventListener('keydown', e => {
+    if (!e.metaKey || e.altKey || e.ctrlKey) return;
+    const page = ({'1':'home','2':'downloads','3':'completed',',':'settings'})[e.key];
+    if (page) { e.preventDefault(); goPage(page); }
+  });
   $('#settingsIcon').addEventListener('click',()=>goPage('settings'));
-  $('#accountBtn').addEventListener('click',()=>goPage('accounts'));
+  $('#accountBtn').addEventListener('click',()=>toast('Guest mode: public links only'));
+  $('#sidebarAccountBtn').addEventListener('click',()=>toast('Guest mode: no login required'));
+  $('#topAccountBtn').addEventListener('click',()=>toast('Guest mode: no login required'));
+
   $('#parallel').addEventListener('input',ev=>$('#parallelValue').textContent=`${ev.target.value} files`);
-  function hydratePrefs() {$('#apiKey').value=state.preferences.apiKey||'';$('#clientId').value=state.preferences.clientId||'';$('#parallel').value=state.preferences.maxParallel||4;$('#parallelValue').textContent=`${$('#parallel').value} files`;$('#savePath').value=state.preferences.saveDirectory||'';}
-  function updateAccount(){const status=state.connected?'Google connected':'Not connected';$('#accountStatus').textContent=status;$('#accountPageStatus').textContent=state.connected?'Connected for restricted folder access':'No Google account connected';$('.status-dot').classList.toggle('connected',state.connected);$('#selectedAccount').textContent=state.connected?'Google account':'Automatic access';$('#connectBtn').style.display=state.connected?'none':'';$('#disconnectBtn').style.display=state.connected?'':'none';}
-  async function savePrefs(){const prefs={apiKey:$('#apiKey').value.trim(),clientId:$('#clientId').value.trim(),maxParallel:Number($('#parallel').value),saveDirectory:$('#savePath').value.trim()};if(tauri){try{await invoke('set_preferences',{preferences:prefs});state.preferences=prefs;toast('Settings saved');}catch(e){toast(String(e),true)}}else{state.preferences=prefs;toast('Settings saved in interface preview only');}}
+  function hydratePrefs() {$('#parallel').value=state.preferences.maxParallel||4;$('#parallelValue').textContent=`${$('#parallel').value} files`;$('#savePath').value=state.preferences.saveDirectory||'';}
+  // Treat Google sub as the stable internal ID; display name and photo are presentation only.
+  function profileDisplayName(){
+    return state.profile?.name || state.profile?.email?.split('@')[0] || 'Google account';
+  }
+  function accountAvatar(selector, fallback) {
+    const el=$(selector); if(!el)return;
+    const name=profileDisplayName();
+    const initial=state.profile?.name?.trim().charAt(0).toUpperCase() || fallback;
+    el.replaceChildren();el.textContent=initial;
+    const picture=state.profile?.picture;
+    if(!picture)return;
+    try{
+      const u=new URL(picture);
+      if(u.protocol!=='https:' || !(u.hostname==='googleusercontent.com' || u.hostname.endsWith('.googleusercontent.com')))return;
+      const img=document.createElement('img');
+      img.alt='';
+      img.referrerPolicy='no-referrer';
+      img.loading='lazy';
+      img.addEventListener('error',()=>{el.replaceChildren();el.textContent=initial},{once:true});
+      img.src=u.href;
+      el.replaceChildren(img);
+    }catch(e){/* fallback initials */}
+  }
+  function showConnectionIssue(error) {
+    state.profileError=error?String(error):'';
+    const el=$('#connectionIssue');
+    el.hidden=!state.profileError;
+    el.textContent=state.profileError;
+  }
+  function updateAccount(){
+    const name=profileDisplayName();
+    const signedIn=!!state.connected;
+    const label=signedIn?(state.profile?.name||'Connected'):'Not connected';
+    $('#accountStatus').textContent=label;
+    $('#accountPageStatus').textContent=signedIn?(state.profile?.email||'Signed in to Google'):'Not connected';
+    $('#accountsName').textContent=signedIn?name:'Google Drive';
+    $('#sidebarAccountName').textContent=signedIn?name:'Not connected';
+    $('#sidebarAccountEmail').textContent=signedIn?(state.profile?.email||'Google account'):'Continue with Google';
+    $('#selectedAccount').textContent=signedIn?name:'Connect Google';
+    $('.status-dot').classList.toggle('connected',signedIn);
+    $('#sidebarAccountDot').classList.toggle('connected',signedIn);
+    $('#connectBtn').style.display=signedIn?'none':'';
+    $('#disconnectBtn').style.display=signedIn?'':'none';
+    $('#connectBtn').disabled=!state.managedOAuth;
+    $('#accountHelp').textContent=!state.managedOAuth?'Google sign-in has not been enabled for this build. Contact the app publisher.':signedIn?'Google sign-in has been verified against the Drive API. Your tokens are stored in macOS Keychain.':'Sign in with your existing Google account. We never ask for your Google password.';
+    $('#diagnoseBtn').style.display=signedIn?'inline-flex':'none';
+    showConnectionIssue(state.profileError);
+    for(const [selector,fallback] of [['#sidebarAvatar','N'],['#topAccountBtn','N'],['#selectorAvatar','G'],['#accountsAvatar','G']])accountAvatar(selector,fallback);
+  }
+  function updateGuest(){
+    $('#accountStatus').textContent='Guest mode';
+    $('#selectedAccount').textContent='Guest · Public links';
+    $('#sidebarAccountName').textContent='Guest mode';
+    $('#sidebarAccountEmail').textContent='No sign-in required';
+  }
+  async function savePrefs(){
+    const prefs={maxParallel:Number($('#parallel').value),saveDirectory:$('#savePath').value.trim()};
+    if(tauri){try{await invoke('set_preferences',{preferences:prefs});state.preferences=prefs;toast('Settings saved');}catch(e){toast(String(e),true)}}
+    else{state.preferences=prefs;toast('Settings saved in interface preview only');}
+  }
   $('#saveSettingsBtn').addEventListener('click',savePrefs);
-  $('#connectBtn').addEventListener('click',async()=>{if(!tauri){toast('Google sign-in works in the compiled macOS application only');return;}$('#connectBtn').disabled=true;$('#connectBtn').textContent='Opening browser…';try{await invoke('connect_google');state.connected=true;updateAccount();toast('Google account connected');}catch(e){toast(String(e),true)}finally{$('#connectBtn').disabled=false;$('#connectBtn').textContent='Connect Google';}});
-  $('#disconnectBtn').addEventListener('click',async()=>{if(!tauri){toast('Preview mode only');return;}try{await invoke('disconnect');state.connected=false;updateAccount();toast('Google disconnected')}catch(e){toast(String(e),true)}});
+  $('#connectBtn').addEventListener('click',async()=>{
+    if(!tauri){toast('Google sign-in is available in the macOS app',true);return;}
+    if(!state.managedOAuth){toast('Google sign-in is not configured by the publisher yet',true);return;}
+    $('#connectBtn').disabled=true;$('#connectBtn').textContent='Opening browser…';
+    try{
+      const profile=await invoke('connect_google');
+      state.profile=profile;state.profileError='';state.connected=true;
+      updateAccount();toast('Signed in as '+profileDisplayName());
+    }catch(e){showConnectionIssue(e);goPage('accounts');toast('Google sign-in failed — see the error below',true)}
+    finally{$('#connectBtn').textContent='Continue with Google';updateAccount();}
+  });
+  $('#diagnoseBtn').addEventListener('click',async()=>{
+    if(!tauri)return;
+    const btn=$('#diagnoseBtn');btn.disabled=true;btn.textContent='Checking Google…';
+    try{
+      state.profile=await invoke('get_google_profile');
+      state.connected=true;state.profileError='';
+      updateAccount();toast('Google account and Drive API are working');
+    }catch(e){
+      state.connected=false;state.profile=null;
+      showConnectionIssue(e);updateAccount();
+      toast('Google connection failed — reconnect your account',true);
+    }finally{btn.disabled=false;btn.textContent='Check Google connection';}
+  });
+  $('#disconnectBtn').addEventListener('click',async()=>{
+    if(!tauri){toast('Preview mode only');return;}
+    try{
+      await invoke('disconnect');state.connected=false;state.profile=null;state.profileError='';
+      updateAccount();toast('Google disconnected');
+    }catch(e){toast(String(e),true)}
+  });
   $('#browseBtn').addEventListener('click',async()=>{if(!tauri){toast('Folder picker is available in the compiled macOS app');return;}try{const selected=await window.__TAURI__.dialog.open({directory:true,multiple:false,title:'Choose download folder'});if(typeof selected==='string'){$('#savePath').value=selected;const prefs={...state.preferences,saveDirectory:selected};await invoke('set_preferences',{preferences:prefs});state.preferences=prefs;}}catch(e){toast(String(e),true)}});
   $('#linkInput').addEventListener('keydown',e=>{if(e.key==='Enter')analyze()});
   $('#analyzeBtn').addEventListener('click',analyze);
@@ -64,21 +160,21 @@
   function failedCount(){return state.plan?.files.filter(f=>progressData(f).status==='failed').length||0}
   function activeCount(){return state.plan?.files.filter(f=>progressData(f).status==='downloading').length||0}
   function currentSpeed(){return state.plan?.files.reduce((sum,f)=>sum+(progressData(f).status==='downloading'?progressData(f).speed||0:0),0)||0}
-  function overallPercent(){return Math.min(100,Math.round(bytesComplete() / Math.max(state.plan?.totalBytes || 1,1)*100));}
-  function projectMarkup(){if(!state.plan)return `<div class="empty-large"><div class="empty-icon">${icon('cloud-download')}</div><h3>Ready when you are</h3><p>Paste a Drive folder link above to begin your next project.</p></div>`;const processed=completedCount();const total=state.plan.files.length;const p=overallPercent();const label=state.summary?.cancelled?'Cancelled':state.summary?'Finished':state.paused?'Paused':state.running?'Downloading':'Ready to download';return `<div class="project-card"><div class="project-icon">${icon('folder')}</div><div class="project-main"><h3>${escapeHtml(state.plan.folderName)}</h3><p>${formatBytes(bytesComplete())} of ${formatBytes(state.plan.totalBytes)} <span style="color:#634f68"> · </span> ${processed} of ${total} files <span style="color:#634f68"> · </span> ${label}</p><div class="progress-track"><div class="progress-fill" style="width:${p}%"></div></div><div class="progress-info"><span>${state.plan.accessMethod==='public'?'Public link':'Google account'} • ${state.plan.warnings?.length||0} warnings</span><span class="progress-percent">${p}%</span></div></div><div class="project-actions">${!state.running?`<button class="btn-primary" id="startProject" ${state.summary&&!state.summary.cancelled?'disabled':''}>${icon('download')} ${state.summary?'Finished':'Start'}</button>`:`<button class="round-action" id="pauseProject" title="${state.paused?'Resume':'Pause'}">${icon(state.paused?'play':'pause')}</button><button class="round-action" id="cancelProject" title="Cancel">${icon('stop')}</button>`}</div></div>`}
+  function overallPercent(){if(state.plan?.accessMethod==='guest'){const total=state.plan?.files.length||0;return total?Math.round(completedCount()/total*100):0;}return Math.min(100,Math.round(bytesComplete()/Math.max(state.plan?.totalBytes||1,1)*100));}
+  function projectMarkup(){if(!state.plan)return `<div class="empty-large"><div class="empty-icon">${icon('cloud-download')}</div><h3>Ready when you are</h3><p>Paste a Drive folder link above to begin your next project.</p></div>`;const processed=completedCount();const total=state.plan.files.length;const p=overallPercent();const label=state.summary?.cancelled?'Cancelled':state.summary?'Finished':state.paused?'Paused':state.running?'Downloading':'Ready to download';return `<div class="project-card"><div class="project-icon">${icon('folder')}</div><div class="project-main"><h3>${escapeHtml(state.plan.folderName)}</h3><p>${state.plan.accessMethod==='guest'?`${formatBytes(bytesComplete())} received (total unknown)`:`${formatBytes(bytesComplete())} of ${formatBytes(state.plan.totalBytes)}`} <span style="color:#634f68"> · </span> ${processed} of ${total} files <span style="color:#634f68"> · </span> ${label}</p><div class="progress-track"><div class="progress-fill" style="width:${p}%"></div></div><div class="progress-info"><span>${state.plan.accessMethod==='guest'?'Guest · public folder':'Public link'} • ${state.plan.warnings?.length||0} warnings</span><span class="progress-percent">${p}%</span></div></div><div class="project-actions">${!state.running?`<button class="btn-primary" id="startProject" ${state.summary&&!state.summary.cancelled?'disabled':''}>${icon('download')} ${state.summary?'Finished':'Start'}</button>`:`<button class="round-action" id="pauseProject" title="${state.paused?'Resume':'Pause'}">${icon(state.paused?'play':'pause')}</button><button class="round-action" id="cancelProject" title="Cancel">${icon('stop')}</button>`}</div></div>`}
   function wireProjectControls(){['#startProject','#startProjectOther'].forEach(s=>$(s)?.addEventListener('click',beginDownload));['#pauseProject','#pauseProjectOther'].forEach(s=>$(s)?.addEventListener('click',togglePause));['#cancelProject','#cancelProjectOther'].forEach(s=>$(s)?.addEventListener('click',cancelDownload));}
   function renderProject(){$('#activeProject').innerHTML=projectMarkup();$('#projectSummary').innerHTML=state.plan?`<div class="active-project">${projectMarkup().replace('id="startProject"','id="startProjectOther"').replace('id="pauseProject"','id="pauseProjectOther"').replace('id="cancelProject"','id="cancelProjectOther"')}</div>`:'';wireProjectControls();}
   function renderFiles(){const files=state.plan?.files||[];$('#filesCount').textContent=files.length;$('#downloadCount').textContent=state.running?activeCount():files.length;
     const search=$('#fileSearch').value.toLowerCase();const visible=files.filter(f=>{const d=progressData(f);return(state.currentFilter==='all'||state.currentFilter===d.status||(state.currentFilter==='downloading'&&d.status==='retrying'))&&f.relativePath.toLowerCase().includes(search)});
-    const html=visible.map(f=>{const d=progressData(f);const ratio=f.size?Math.min(100,Math.round(d.bytes/f.size*100)):d.status==='completed'?100:0;const type=/\.(mp4|mov|mxf|mkv|avi)$/i.test(f.relativePath)?'video':/\.(mp3|wav|aif|aiff)$/i.test(f.relativePath)?'music':'file';let status=d.status==='failed'?'Issue':d.status==='completed'?'Completed':d.status==='verifying'?'Verifying':d.status==='downloading'?'Downloading':d.status==='retrying'?'Retrying':'Queued';return `<div class="file-row"><div class="filename"><div class="file-icon">${icon(type)}</div><div class="name-data"><b title="${escapeHtml(f.relativePath)}">${escapeHtml(f.name)}</b><small title="${escapeHtml(f.relativePath)}">${escapeHtml(f.relativePath)}</small></div></div><div class="file-size">${formatBytes(f.size)}</div><div class="mini-progress"><div class="mini-track"><i style="width:${ratio}%"></i></div><small>${ratio}%</small></div><div class="file-status ${escapeHtml(d.status)}" title="${escapeHtml(d.message||'')}">${status}</div></div>`}).join('');$('#fileRows').innerHTML=html||`<div class="files-empty">${files.length?'No matching files':'No files yet. Analyze a folder to get started.'}</div>`;
+    const html=visible.map(f=>{const d=progressData(f);const ratio=f.size?Math.min(100,Math.round(d.bytes/f.size*100)):d.status==='completed'?100:0;const progressLabel=f.size?`${ratio}%`:d.status==='completed'?'Done':d.bytes?formatBytes(d.bytes):'—';const type=/\.(mp4|mov|mxf|mkv|avi)$/i.test(f.relativePath)?'video':/\.(mp3|wav|aif|aiff)$/i.test(f.relativePath)?'music':'file';let status=d.status==='failed'?'Issue':d.status==='completed'?'Completed':d.status==='verifying'?'Verifying':d.status==='downloading'?'Downloading':d.status==='retrying'?'Retrying':'Queued';return `<div class="file-row"><div class="filename"><div class="file-icon">${icon(type)}</div><div class="name-data"><b title="${escapeHtml(f.relativePath)}">${escapeHtml(f.name)}</b><small title="${escapeHtml(f.relativePath)}">${escapeHtml(f.relativePath)}</small></div></div><div class="file-size">${formatBytes(f.size)}</div><div class="mini-progress"><div class="mini-track"><i style="width:${ratio}%"></i></div><small>${progressLabel}</small></div><div class="file-status ${escapeHtml(d.status)}" title="${escapeHtml(d.message||'')}">${status}</div></div>`}).join('');$('#fileRows').innerHTML=html||`<div class="files-empty">${files.length?'No matching files':'No files yet. Analyze a folder to get started.'}</div>`;
     const completed=files.filter(f=>progressData(f).status==='completed');$('#completedRows').innerHTML=completed.map(f=>`<div class="file-row"><div class="filename"><div class="file-icon">${icon('check')}</div><div class="name-data"><b>${escapeHtml(f.name)}</b><small>${escapeHtml(f.relativePath)}</small></div></div><div class="file-size">${formatBytes(f.size)}</div><div class="mini-progress"><div class="mini-track"><i style="width:100%"></i></div><small>100%</small></div><div class="file-status completed">Completed</div></div>`).join('')||'<div class="files-empty">Nothing completed yet.</div>';
   }
   const speedSeries=[];
   if (state.demo) {
     for(let i=0;i<39;i++) speedSeries.push(15 + 5*Math.sin(i*.33) + 2*Math.sin(i*.91));
   }
-  function updateInsights(){const sp=currentSpeed();let value=sp/1048576;$('#speedCard').innerHTML=`${value.toFixed(1)} <span>MB/s</span>`;$('#totalTransferred').innerHTML=`${(bytesComplete()/1024**3).toFixed(2)} <small>GB</small>`;$('#transferSubtext').textContent=state.plan?`of ${formatBytes(state.plan.totalBytes)} total`:'No active transfer';$('#processedFiles').innerHTML=`${completedCount()} <small>/ ${state.plan?.files.length||0}</small>`;speedSeries.push(value);if(speedSeries.length>40)speedSeries.shift();const peak=Math.max(.1,...speedSeries);$('#speedPeak').textContent=`PEAK ${peak.toFixed(1)} MB/s`;const points=speedSeries.map((n,i)=>`${(i/39*256).toFixed(1)},${(66-60*n/peak).toFixed(1)}`);if(points.length>1){$('#chartLine').setAttribute('d','M'+points.join(' L'));$('#chartArea').setAttribute('d','M'+points.join(' L')+' L256,72 L0,72Z')}}
-  function renderWarnings(){const warnings=state.plan?.warnings||[];$('#warningList').innerHTML=warnings.length?`<details class="warnings"><summary>${warnings.length} item${warnings.length===1?'':'s'} not included <span>Show details</span></summary><div>${warnings.map(w=>`<p>${escapeHtml(w)}</p>`).join('')}</div></details>`:'';}
+  function updateInsights(){const sp=currentSpeed();let value=sp/1048576;$('#speedCard').innerHTML=`${value.toFixed(1)} <span>MB/s</span>`;$('#totalTransferred').innerHTML=`${(bytesComplete()/1024**3).toFixed(2)} <small>GB</small>`;$('#transferSubtext').textContent=state.plan?(state.plan.accessMethod==='guest'?'Guest mode · total size unknown':`of ${formatBytes(state.plan.totalBytes)} total`):'No active transfer';$('#processedFiles').innerHTML=`${completedCount()} <small>/ ${state.plan?.files.length||0}</small>`;speedSeries.push(value);if(speedSeries.length>40)speedSeries.shift();const peak=Math.max(.1,...speedSeries);$('#speedPeak').textContent=`PEAK ${peak.toFixed(1)} MB/s`;const points=speedSeries.map((n,i)=>`${(i/39*256).toFixed(1)},${(66-60*n/peak).toFixed(1)}`);if(points.length>1){$('#chartLine').setAttribute('d','M'+points.join(' L'));$('#chartArea').setAttribute('d','M'+points.join(' L')+' L256,72 L0,72Z')}}
+  function renderWarnings(){const warnings=state.plan?.warnings||[];$('#warningList').innerHTML=warnings.length?`<details class="warnings"><summary>${warnings.length} guest note${warnings.length===1?'':'s'} <span>Show details</span></summary><div>${warnings.map(w=>`<p>${escapeHtml(w)}</p>`).join('')}</div></details>`:'';}
   function render(){renderProject();renderWarnings();renderFiles();updateInsights()}
   let renderPending=false;
   function queueRender(){if(renderPending)return;renderPending=true;setTimeout(()=>{renderPending=false;render()},150)}
@@ -87,7 +183,12 @@
   $('#clearViewBtn').addEventListener('click',()=>{if(state.running){toast('Finish or cancel the active download first',true);return;}state.plan=null;state.progress={};state.summary=null;render();toast('Local transfer view cleared. Downloaded files are untouched.')});
   let demoTimer;
   function startDemoProgress(){clearInterval(demoTimer);demoTimer=setInterval(()=>{if(!state.running){clearInterval(demoTimer);return}if(state.paused)return;let active=0;for(const f of state.plan.files){const d=state.progress[f.id];if(d.status==='completed')continue;if(active>=4)break;active++;d.status='downloading';const increment=Math.min(28*1048576,f.size-d.bytes);d.bytes+=increment;d.speed=increment*2;if(d.bytes>=f.size){d.status='completed';d.speed=0}}if(completedCount()===state.plan.files.length){state.running=false;state.summary={completed:completedCount(),failed:0,cancelled:false,errors:[]};toast('Demo download complete (no real files created)');clearInterval(demoTimer)}queueRender()},500)}
-  async function initialize(){if(tauri){try{state.preferences=await invoke('get_preferences');state.connected=await invoke('is_connected');window.__TAURI__.event.listen('north:progress',event=>{const p=event.payload;if(!p?.id)return;state.progress[p.id]={bytes:p.bytes??0,status:p.status,speed:p.speed??0,message:p.message};queueRender()});window.__TAURI__.event.listen('north:summary',event=>{state.summary=event.payload;state.running=false;state.paused=false;render();if(state.summary.cancelled)toast('Transfer cancelled. Partial files kept.');else if(state.summary.failed)toast(`${state.summary.failed} file(s) failed. Inspect Issues for details.`,true);else toast(`Downloaded ${state.summary.completed} files successfully!`)});}catch(e){toast(`App initialization issue: ${e}`,true)}}else{$('#previewBanner').style.display='block';$('#linkInput').value='https://drive.google.com/drive/folders/DEMO-FOLDER';state.plan=demoPlan();for(const f of state.plan.files) state.progress[f.id]={bytes:0,status:'queued',speed:0};state.progress[state.plan.files[0].id]={bytes:Math.floor(state.plan.files[0].size*.42),status:'downloading',speed:22*1048576};state.progress[state.plan.files[2].id]={bytes:state.plan.files[2].size,status:'completed',speed:0};state.progress[state.plan.files[1].id]={bytes:Math.floor(state.plan.files[1].size*.14),status:'downloading',speed:8*1048576};state.running=true;$('#savePath').value='/Users/you/Downloads/Client Projects';}
-    hydratePrefs();if(state.demo)$('#savePath').value='/Users/you/Downloads/Client Projects';updateAccount();render();setInterval(updateInsights,1500);}
+  async function initialize(){if(tauri){try{
+    state.preferences=await invoke('get_preferences');
+    state.connected=false;
+    state.profile=null;
+    state.managedOAuth=false;
+    window.__TAURI__.event.listen('north:progress',event=>{const p=event.payload;if(!p?.id)return;state.progress[p.id]={bytes:p.bytes??0,status:p.status,speed:p.speed??0,message:p.message};queueRender()});window.__TAURI__.event.listen('north:summary',event=>{state.summary=event.payload;state.running=false;state.paused=false;render();if(state.summary.cancelled)toast('Transfer cancelled. Partial files kept.');else if(state.summary.failed)toast(`${state.summary.failed} file(s) failed. Inspect Issues for details.`,true);else toast(`Downloaded ${state.summary.completed} files successfully!`)});}catch(e){toast(`App initialization issue: ${e}`,true)}}else{$('#previewBanner').style.display='block';$('#linkInput').value='https://drive.google.com/drive/folders/DEMO-FOLDER';state.plan=demoPlan();for(const f of state.plan.files) state.progress[f.id]={bytes:0,status:'queued',speed:0};state.progress[state.plan.files[0].id]={bytes:Math.floor(state.plan.files[0].size*.42),status:'downloading',speed:22*1048576};state.progress[state.plan.files[2].id]={bytes:state.plan.files[2].size,status:'completed',speed:0};state.progress[state.plan.files[1].id]={bytes:Math.floor(state.plan.files[1].size*.14),status:'downloading',speed:8*1048576};state.running=true;$('#savePath').value='/Users/you/Downloads/Client Projects';}
+    hydratePrefs();if(state.demo)$('#savePath').value='/Users/you/Downloads/Client Projects';updateGuest();render();setInterval(updateInsights,1500);}
   initialize();
 })();

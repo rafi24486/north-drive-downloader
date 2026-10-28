@@ -17,3 +17,77 @@
 .page-home .panel-glow{border-color:#8036619c;box-shadow:0 0 0 1px #f442900b,0 0 35px #df238c13,inset 0 0 40px #941a470a}
 .page-home .form-hint{margin-top:13px}
 @media(max-width:720px){.page-home .home-heading{padding-top:29px}.home-ready{display:none}.page-home .link-panel{padding:16px}}
+
+/* V1.0 development — native app behavior and quieter visual hierarchy */
+html,body{-webkit-user-select:none;user-select:none}
+input,textarea,select,[contenteditable="true"],.selectable{-webkit-user-select:text;user-select:text}
+img,svg{-webkit-user-drag:none}
+[data-tauri-drag-region]{-webkit-app-region:drag;app-region:drag;cursor:default}
+.topbar [data-tauri-drag-region],.brand [data-tauri-drag-region]{cursor:default}
+.topbar button,.topbar input,.topbar .top-actions,.sidebar button{-webkit-app-region:no-drag;app-region:no-drag}
+.page-home .link-panel{background:linear-gradient(150deg,#15101c,#110e17 70%);box-shadow:0 0 0 1px #df368719,0 12px 42px #0000002b;border-color:#6f355a90}
+.page-home .home-heading{padding-top:30px}
+.page-home .section-heading{margin-top:32px}
+.btn-primary{box-shadow:0 3px 18px #d72c792e}
+.btn-primary:hover{box-shadow:0 5px 21px #e83b9550}
+.developer-settings{border:1px solid #362a3e;border-radius:12px;padding:14px 17px;margin-top:18px;background:#100d17}
+.developer-settings summary{font-size:12px;color:#cbb8cf;cursor:pointer;font-weight:600}
+.developer-settings[open] summary{margin-bottom:12px}
+.developer-settings .helper-copy{margin:6px 0 17px}
+@media(max-width:980px){
+ .shell{grid-template-columns:74px minmax(0,1fr)}
+ .sidebar{padding:0 10px 15px;align-items:center}
+ .sidebar .brand,.sidebar .nav-section,.sidebar .sidebar-note,.sidebar .sidebar-bottom{display:none}
+ .sidebar .dragspace{height:70px;width:100%}
+ .sidebar .nav-item{width:48px;height:48px;display:flex;justify-content:center;padding:0;font-size:0;gap:0;margin-bottom:8px}
+ .sidebar .nav-icon svg{width:21px;height:21px}
+ .sidebar .nav-count{display:none}
+ .main-pane{padding:0 20px 32px;min-width:0}
+ .topbar{height:70px}
+ .page-title-row{padding-top:31px}
+ .preview-banner{left:74px;right:0}
+}
+@media(max-width:760px){
+ .url-row{flex-wrap:wrap;padding:12px;gap:12px}
+ .url-row input{min-width:calc(100% - 45px);min-height:34px}
+ .url-row .btn-primary{width:100%}
+ .link-options{flex-direction:column}
+ .account-selector{min-width:0;width:100%}
+ .files-panel{overflow-x:auto}
+ .files-head,.file-row{min-width:610px}
+ .files-toolbar{flex-direction:column;align-items:stretch}
+ .file-search{width:100%}
+ .project-card{flex-wrap:wrap}
+ .project-actions{width:100%;justify-content:flex-end}
+ .page-title-row h1{font-size:32px}
+ .connection-pill{max-width:150px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+}
+@media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.001ms!important;transition-duration:.001ms!important}}
+
+/* Signed-in Google identity: profile images are optional and never user IDs. */
+.account-profile-button{appearance:none;border:0;background:transparent;color:inherit;cursor:pointer;text-align:left;width:100%;border-radius:12px;min-width:0;padding:7px 9px}
+.account-profile-button:hover{background:#ffffff0a}
+.account-name-block{min-width:0;flex:1}
+.account-name-block strong,.account-name-block small{max-width:145px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.avatar,.account-avatar-small,.google-large,.user-avatar{overflow:hidden;flex-shrink:0}
+.avatar img,.account-avatar-small img,.google-large img,.user-avatar img{display:block;width:100%;height:100%;object-fit:cover;border-radius:inherit}
+.account-avatar-small{height:26px;width:26px;border-radius:50%;display:grid;place-items:center;background:#35203e;color:#ff9aca;font-weight:700;font-size:11px}
+.account-avatar-button{appearance:none;cursor:pointer;padding:0}
+.account-avatar-button:hover{outline:1px solid #fa65b6}
+.google-large.account-profile-large{border-radius:50%;font-size:23px}
+.account-identity{min-width:0}
+.account-identity h3,.account-identity p{max-width:260px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tiny-dot{background:#6c6270}
+.tiny-dot.connected{background:#3bcfa0;box-shadow:0 0 9px #2cbf8b55}
+@media(max-width:980px){.account-profile-button{width:48px;min-height:48px;padding:5px}.account-profile-button .account-name-block,.account-profile-button .tiny-dot{display:none}.sidebar .sidebar-bottom.account-profile-button{display:flex}.sidebar-bottom .avatar{height:36px;width:36px}}
+@media(max-width:760px){.account-info{flex-wrap:wrap}.account-info .space{display:none}.account-info #connectBtn,.account-info #disconnectBtn{margin-left:auto}}
+
+/* OAuth recovery: unlike a temporary toast, errors remain until resolved. */
+.connection-issue{margin-top:14px;padding:14px 16px;border-radius:12px;border:1px solid #854d54;background:#411d264a;color:#ffc9d1;line-height:1.7;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere}
+.connection-issue[hidden]{display:none}
+#diagnoseBtn{margin-top:13px}
+
+/* Public guest edition: remove sign-in affordances while retaining compact navigation. */
+.nav-item[data-page="accounts"],#page-accounts,#topAccountBtn,#sidebarAccountBtn{display:none!important}
+.account-selector{cursor:default}
+.connection-pill .status-dot{background:#4dd19c}

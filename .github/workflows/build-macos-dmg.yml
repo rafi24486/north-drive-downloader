@@ -1,7 +1,7 @@
 name: Build macOS Universal DMG
 on:
   push:
-    branches: [main]
+    branches: [main, v1.0-development]
     tags: ['v*']
   workflow_dispatch:
 
@@ -32,6 +32,8 @@ jobs:
         run: npx tauri icon assets/icon.svg
       - name: Validate frontend syntax
         run: node --check ui/app.js
+      - name: Run Rust regression tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --quiet
       - name: Build and verify drag-and-drop DMG
         run: zsh scripts/build-dmg.command
       - name: Upload DMG
