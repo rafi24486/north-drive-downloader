@@ -1,12 +1,17 @@
 name: Build macOS Universal DMG
 on:
   push:
-    branches: [main]
+    branches: [main, "fix/**"]
     tags: ['v*']
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# Build only the latest commit on a branch to avoid duplicate DMGs.
+concurrency:
+  group: macos-dmg-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   dmg:
@@ -17,9 +22,9 @@ jobs:
       APPLE_SIGNING_IDENTITY: '-'
     steps:
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
       - name: Setup Node 22
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: '22'
       - name: Setup Rust universal targets
@@ -32,10 +37,12 @@ jobs:
         run: npx tauri icon assets/icon.svg
       - name: Validate frontend syntax
         run: node --check ui/app.js
+      - name: Run Rust transfer regression tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
       - name: Build and verify drag-and-drop DMG
         run: zsh scripts/build-dmg.command
       - name: Upload DMG
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: NorthDriveDownloader-macOS-Universal-DMG
           path: dist/*.dmg

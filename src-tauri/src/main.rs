@@ -1,31 +1,26 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rand::RngCore;
 use reqwest::{header, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::{HashMap, HashSet, VecDeque}, fs, io, path::{Component, Path, PathBuf}, process::Command, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}, time::{Duration, Instant}};
+use std::{collections::{HashMap, HashSet, VecDeque}, fs, path::{Component, Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}, time::{Duration, Instant}};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::{fs as async_fs, io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, time::sleep};
+use tokio::{fs as async_fs, io::{AsyncReadExt, AsyncWriteExt}, time::sleep};
 
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
 const DRIVE_BASE: &str = "https://www.googleapis.com/drive/v3/files";
-const SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
-const KEYCHAIN_SERVICE: &str = "com.northdrive.downloader.oauth";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Preferences {
     api_key: String,
-    client_id: String,
     save_directory: String,
     max_parallel: usize,
 }
 impl Default for Preferences {
     fn default() -> Self {
-        Self { api_key: String::new(), client_id: String::new(), save_directory: String::new(), max_parallel: 4 }
+        Self { api_key: String::new(), save_directory: String::new(), max_parallel: 2 }
     }
 }
 
@@ -40,6 +35,7 @@ struct DownloadItem {
     md5_checksum: Option<String>,
     resource_key: Option<String>,
     export_mime: Option<String>,
+    modified_time: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,6 +79,7 @@ struct DriveFile {
     size: Option<String>,
     md5_checksum: Option<String>,
     resource_key: Option<String>,
+    modified_time: Option<String>,
     capabilities: Option<Capabilities>,
 }
 #[derive(Debug, Deserialize)]
@@ -91,36 +88,12 @@ struct Capabilities { can_download: Option<bool> }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FilePage { #[serde(default)] files: Vec<DriveFile>, next_page_token: Option<String> }
-#[derive(Deserialize)]
-struct OAuthToken { access_token: String, refresh_token: Option<String> }
-
+// This release never stores or sends Google account credentials.
 #[derive(Clone)]
-enum Access { Public(String), OAuth(String) }
+struct Access { api_key: String }
 impl Access {
-    fn method(&self) -> &'static str { match self { Access::Public(_) => "public", Access::OAuth(_) => "oauth" } }
     fn request(&self, client: &Client, url: &str) -> reqwest::RequestBuilder {
-        match self {
-            Access::Public(key) => client.get(url).query(&[("key", key.as_str())]),
-            Access::OAuth(token) => client.get(url).bearer_auth(token),
-        }
-    }
-}
-
-type AuthCache = Arc<tokio::sync::Mutex<(Instant, Access)>>;
-
-async fn current_access(cache: &AuthCache, client: &Client, prefs: &Preferences) -> Result<Access, String> {
-    let mut stored = cache.lock().await;
-    if matches!(stored.1, Access::OAuth(_)) && stored.0.elapsed() > Duration::from_secs(45 * 60) {
-        stored.1 = Access::OAuth(refresh_access_token(client, prefs).await?);
-        stored.0 = Instant::now();
-    }
-    Ok(stored.1.clone())
-}
-
-async fn expire_access(cache: &AuthCache) {
-    let mut stored = cache.lock().await;
-    if matches!(stored.1, Access::OAuth(_)) {
-        stored.0 = Instant::now() - Duration::from_secs(3600);
+        client.get(url).query(&[("key", self.api_key.as_str())])
     }
 }
 
@@ -137,104 +110,20 @@ fn persist_prefs(app: &AppHandle, prefs: &Preferences) -> Result<(), String> {
 fn read_prefs(app: &AppHandle) -> Preferences {
     config_file(app).ok().and_then(|p| fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
-fn keychain_entry() -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, "refresh-token").map_err(|e| e.to_string())
-}
-fn has_login() -> bool { keychain_entry().and_then(|e| e.get_password().map_err(|x| x.to_string())).is_ok() }
-
 #[tauri::command]
 fn get_preferences(state: State<'_, Arc<AppState>>) -> Preferences { state.prefs.lock().unwrap().clone() }
 #[tauri::command]
-fn is_connected() -> bool { has_login() }
-#[tauri::command]
 fn set_preferences(app: AppHandle, state: State<'_, Arc<AppState>>, preferences: Preferences) -> Result<(), String> {
     if preferences.max_parallel == 0 || preferences.max_parallel > 8 { return Err("Parallel downloads must be between 1 and 8".into()); }
-    let preferences = Preferences { api_key: preferences.api_key.trim().to_string(), client_id: preferences.client_id.trim().to_string(), save_directory: preferences.save_directory.trim().to_string(), max_parallel: preferences.max_parallel };
+    let preferences = Preferences { api_key: preferences.api_key.trim().to_string(), save_directory: preferences.save_directory.trim().to_string(), max_parallel: preferences.max_parallel };
     persist_prefs(&app, &preferences)?;
     *state.prefs.lock().unwrap() = preferences;
     Ok(())
 }
-#[tauri::command]
-fn disconnect() -> Result<(), String> {
-    match keychain_entry()?.delete_credential() { Ok(_) => Ok(()), Err(e) if e.to_string().contains("No matching") => Ok(()), Err(e) => Err(e.to_string()) }
-}
-
-fn new_verifier() -> (String, String, String) {
-    let mut raw = [0u8; 32]; rand::rngs::OsRng.fill_bytes(&mut raw);
-    let verifier = URL_SAFE_NO_PAD.encode(raw);
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    rand::rngs::OsRng.fill_bytes(&mut raw);
-    (verifier, challenge, URL_SAFE_NO_PAD.encode(raw))
-}
-
-#[tauri::command]
-async fn connect_google(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    let client_id = state.prefs.lock().unwrap().client_id.clone();
-    if client_id.is_empty() { return Err("Add your Google OAuth Desktop Client ID in Settings first".into()); }
-    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
-    let (verifier, challenge, state_code) = new_verifier();
-    let mut authorize = url::Url::parse("https://accounts.google.com/o/oauth2/v2/auth").unwrap();
-    authorize.query_pairs_mut()
-        .append_pair("client_id", &client_id)
-        .append_pair("redirect_uri", &redirect_uri)
-        .append_pair("response_type", "code")
-        .append_pair("scope", SCOPE)
-        .append_pair("access_type", "offline")
-        .append_pair("prompt", "consent")
-        .append_pair("code_challenge", &challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("state", &state_code);
-    Command::new("open").arg(authorize.as_str()).spawn().map_err(|e| format!("Cannot open browser: {e}"))?;
-    let code = tokio::time::timeout(Duration::from_secs(180), async {
-        loop {
-            let (mut stream, addr) = listener.accept().await.map_err(|e| e.to_string())?;
-            if !addr.ip().is_loopback() { continue; }
-            let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf).await.map_err(|e| e.to_string())?;
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let target = req.lines().next().and_then(|s| s.split_whitespace().nth(1)).ok_or("Invalid callback")?;
-            let cb = url::Url::parse(&format!("http://127.0.0.1:{port}{target}")).map_err(|e| e.to_string())?;
-            if cb.path() != "/callback" { continue; }
-            let params: HashMap<String,String> = cb.query_pairs().into_owned().collect();
-            let valid = params.get("state") == Some(&state_code);
-            let success = valid && params.contains_key("code");
-            let message = if success { "Google connected. You can close this tab and return to North Drive Downloader." } else { "Authorization failed. Return to North Drive Downloader." };
-            let body = format!("<html><body style='font-family:-apple-system;background:#0c0912;color:#fff;text-align:center;padding:100px'><h2>{message}</h2></body></html>");
-            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
-            let _ = stream.write_all(response.as_bytes()).await;
-            if !valid { return Err("OAuth state mismatch".into()); }
-            if let Some(error) = params.get("error") { return Err(format!("Google authorization denied: {error}")); }
-            return params.get("code").cloned().ok_or_else(|| "Missing authorization code".to_string());
-        }
-    }).await.map_err(|_| "Google sign-in timed out".to_string())??;
-    let response = state.client.post("https://oauth2.googleapis.com/token").form(&[
-        ("code", code.as_str()), ("client_id", client_id.as_str()), ("code_verifier", verifier.as_str()),
-        ("redirect_uri", redirect_uri.as_str()), ("grant_type", "authorization_code")
-    ]).send().await.map_err(|e| e.to_string())?;
-    if !response.status().is_success() { return Err(format!("Google sign-in failed: {}", response.text().await.unwrap_or_default())); }
-    let token: OAuthToken = response.json().await.map_err(|e| e.to_string())?;
-    let refresh = token.refresh_token.ok_or("Google did not return a refresh token; revoke access and retry")?;
-    keychain_entry()?.set_password(&refresh).map_err(|e| e.to_string())?;
-    Ok("Google account connected".into())
-}
-
-async fn refresh_access_token(client: &Client, prefs: &Preferences) -> Result<String, String> {
-    if prefs.client_id.is_empty() { return Err("OAuth Client ID not configured".into()); }
-    let refresh = keychain_entry()?.get_password().map_err(|_| "Google account not connected. Go to Accounts and sign in".to_string())?;
-    let response = client.post("https://oauth2.googleapis.com/token").form(&[
-        ("client_id", prefs.client_id.as_str()), ("refresh_token", refresh.as_str()), ("grant_type", "refresh_token")
-    ]).send().await.map_err(|e| e.to_string())?;
-    if !response.status().is_success() { return Err("Google session expired or was revoked. Reconnect your account".into()); }
-    let token: OAuthToken = response.json().await.map_err(|e| e.to_string())?;
-    Ok(token.access_token)
-}
-
 fn parse_drive_link(link: &str) -> Result<(String, Option<String>), String> {
     let url = url::Url::parse(link.trim()).map_err(|_| "Paste a complete Google Drive folder URL".to_string())?;
     let domain = url.host_str().unwrap_or("");
-    if domain != "drive.google.com" && domain != "docs.google.com" { return Err("Only Google Drive URLs are supported".into()); }
+    if url.scheme() != "https" || (domain != "drive.google.com" && domain != "docs.google.com") { return Err("Only secure Google Drive URLs are supported".into()); }
     let pieces: Vec<_> = url.path_segments().map(|s| s.collect()).unwrap_or_else(Vec::new);
     let id: Option<String> = if let Some(i) = pieces.iter().position(|p| *p == "folders") {
         pieces.get(i + 1).map(|value| (*value).to_string())
@@ -263,43 +152,63 @@ fn unique_name(name: &str, used: &mut HashSet<String>) -> String {
     format!("{}-duplicate", name)
 }
 
+
 async fn json_request<T: for<'de> Deserialize<'de>>(client: &Client, access: &Access, url: &str, params: &[(&str, String)], keys: &HashMap<String, String>) -> Result<T, String> {
-    let mut req = access.request(client, url).query(params);
-    if !keys.is_empty() {
-        let header_value = keys.iter().map(|(k,v)| format!("{k}/{v}")).collect::<Vec<_>>().join(",");
-        req = req.header("X-Goog-Drive-Resource-Keys", header_value);
+    let key_header = if keys.is_empty() { None } else {
+        Some(keys.iter().map(|(k,v)| format!("{k}/{v}")).collect::<Vec<_>>().join(","))
+    };
+    for attempt in 1..=6u32 {
+        let mut request = access.request(client, url).query(params);
+        if let Some(header_value) = &key_header {
+            request = request.header("X-Goog-Drive-Resource-Keys", header_value);
+        }
+        let result = request.send().await;
+        match result {
+            Ok(response) if response.status().is_success() => {
+                return response.json::<T>().await.map_err(|e| format!("Unexpected Google Drive response: {e}"));
+            }
+            Ok(response) => {
+                let status = response.status();
+                let retry_after = response.headers().get(header::RETRY_AFTER)
+                    .and_then(|h| h.to_str().ok()).and_then(|s| s.parse::<u64>().ok());
+                let detail = response.text().await.unwrap_or_default();
+                let retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+                    || (status == StatusCode::FORBIDDEN && (detail.contains("rateLimitExceeded") || detail.contains("userRateLimitExceeded")));
+                if !retryable || attempt == 6 {
+                    return Err(format!("Google Drive HTTP {}: {}", status.as_u16(), detail.chars().take(300).collect::<String>()));
+                }
+                let delay = retry_after.unwrap_or((1u64 << attempt).min(30)).clamp(1, 60);
+                sleep(Duration::from_secs(delay)).await;
+            }
+            Err(e) => {
+                if attempt == 6 { return Err(format!("Google Drive network error after {attempt} attempts: {e}")); }
+                sleep(Duration::from_secs((1u64 << attempt).min(30))).await;
+            }
+        }
     }
-    let response = req.send().await.map_err(|e| e.to_string())?;
-    if !response.status().is_success() {
-        let code = response.status();
-        let detail = response.text().await.unwrap_or_default();
-        return Err(format!("Google Drive HTTP {}: {}", code.as_u16(), detail.chars().take(250).collect::<String>()));
-    }
-    response.json::<T>().await.map_err(|e| format!("Unexpected Google Drive response: {e}"))
+    Err("Drive request exhausted retries".into())
 }
+
 async fn metadata(client: &Client, access: &Access, id: &str, keys: &HashMap<String,String>) -> Result<DriveFile, String> {
     json_request(client, access, &format!("{DRIVE_BASE}/{id}"), &[
-        ("fields", "id,name,mimeType,size,md5Checksum,resourceKey,capabilities(canDownload)".into()),
+        ("fields", "id,name,mimeType,size,md5Checksum,resourceKey,modifiedTime,capabilities(canDownload)".into()),
         ("supportsAllDrives", "true".into())
     ], keys).await
 }
 async fn resolve_access(client: &Client, prefs: &Preferences, id: &str, rk: &Option<String>) -> Result<(Access, DriveFile), String> {
-    let mut keys = HashMap::new(); if let Some(k) = rk { keys.insert(id.to_string(), k.clone()); }
-    let mut public_err = String::new();
-    if !prefs.api_key.is_empty() {
-        let public = Access::Public(prefs.api_key.clone());
-        match metadata(client, &public, id, &keys).await {
-            Ok(meta) => return Ok((public,meta)), Err(err) => public_err = err
-        }
+    let api_key = prefs.api_key.trim();
+    if api_key.is_empty() {
+        return Err("To scan public Google Drive folders without signing in, add a Google Drive API key in Settings. No Google account login is required.".into());
     }
-    if has_login() {
-        let oauth = Access::OAuth(refresh_access_token(client, prefs).await?);
-        let meta = metadata(client, &oauth, id, &keys).await?;
-        return Ok((oauth, meta));
-    }
-    Err(if prefs.api_key.is_empty() {
-        "Configure a Google Drive API key for public links, or connect your Google account for restricted links".into()
-    } else { format!("Public access failed: {public_err}. If this is restricted, connect an authorized Google account") })
+    let mut keys = HashMap::new();
+    if let Some(k) = rk { keys.insert(id.to_string(), k.clone()); }
+    let access = Access { api_key: api_key.to_string() };
+    let meta = metadata(client, &access, id, &keys).await.map_err(|error| {
+        if error.contains("HTTP 401") || error.contains("HTTP 403") || error.contains("HTTP 404") {
+            format!("This folder cannot be accessed publicly. Set Google Drive sharing to 'Anyone with the link' and verify your API key. Details: {error}")
+        } else { error }
+    })?;
+    Ok((access, meta))
 }
 fn workspace_export(mime: &str) -> Option<(&'static str, &'static str)> {
     match mime {
@@ -332,7 +241,7 @@ async fn scan_folder(link: String, state: State<'_, Arc<AppState>>) -> Result<Fo
             let mut params = vec![
                 ("q", format!("'{}' in parents and trashed = false", folder_id)),
                 ("pageSize", "1000".into()),
-                ("fields", "nextPageToken,files(id,name,mimeType,size,md5Checksum,resourceKey,capabilities(canDownload))".into()),
+                ("fields", "nextPageToken,files(id,name,mimeType,size,md5Checksum,resourceKey,modifiedTime,capabilities(canDownload))".into()),
                 ("supportsAllDrives", "true".into()),
                 ("includeItemsFromAllDrives", "true".into()),
             ];
@@ -368,14 +277,14 @@ async fn scan_folder(link: String, state: State<'_, Arc<AppState>>) -> Result<Fo
                 let file_path = relative_path;
                 let size = entry.size.and_then(|v| v.parse::<u64>().ok());
                 total_bytes = total_bytes.saturating_add(size.unwrap_or_default());
-                files.push(DownloadItem { id: entry.id, name: final_name, relative_path: file_path, size, mime_type: entry.mime_type, md5_checksum: entry.md5_checksum, resource_key: entry.resource_key, export_mime: export.map(|(m,_)| m.into()) });
+                files.push(DownloadItem { id: entry.id, name: final_name, relative_path: file_path, size, mime_type: entry.mime_type, md5_checksum: entry.md5_checksum, resource_key: entry.resource_key, export_mime: export.map(|(m,_)| m.into()), modified_time: entry.modified_time });
             }
             page = result.next_page_token;
             if page.is_none() { break; }
         }
         if !found_children && !parent_path.is_empty() { empty_folders.push(parent_path); }
     }
-    Ok(FolderPlan { folder_id: id, folder_name: sanitized_name(&root.name), files, empty_folders, total_bytes, warnings, access_method: access.method().into(), folder_resource_key: rk.or(root.resource_key) })
+    Ok(FolderPlan { folder_id: id, folder_name: sanitized_name(&root.name), files, empty_folders, total_bytes, warnings, access_method: "public".into(), folder_resource_key: rk.or(root.resource_key) })
 }
 
 fn safe_relative(raw: &str) -> Result<PathBuf, String> {
@@ -417,103 +326,248 @@ async fn wait_for_run(control: &RunControl) -> Result<(), String> {
         sleep(Duration::from_millis(200)).await;
     }
 }
-async fn download_one(app: &AppHandle, client: &Client, prefs: &Preferences, auth_cache: &AuthCache, file: &DownloadItem, root: &Path, control: &RunControl) -> Result<(), String> {
+
+fn retryable_transfer_error(error: &str) -> bool {
+    // Do not waste minutes retrying permanent permissions, invalid requests, or unavailable files.
+    let permanent = ["HTTP 400", "HTTP 401", "HTTP 404", "HTTP 410", "HTTP 416"];
+    if permanent.iter().any(|code| error.contains(code)) { return false; }
+    if error.contains("HTTP 403") {
+        return ["rateLimitExceeded", "userRateLimitExceeded", "quotaExceeded", "Rate Limit", "rate limit"]
+            .iter().any(|reason| error.contains(reason));
+    }
+    if error.contains("MD5 checksum mismatch after clean retry")
+        || error.contains("Remote file changed during resume") { return false; }
+    true
+}
+
+fn validate_resume_response(
+    offset: u64, status: StatusCode, content_range: Option<&str>, expected_size: Option<u64>,
+) -> Result<bool, String> {
+    if offset == 0 {
+        if status != StatusCode::OK { return Err(format!("Unexpected download response HTTP {status}")); }
+        return Ok(false);
+    }
+    // A proxy may ignore Range. 200 means replace the partial; NEVER append a whole file to it.
+    if status == StatusCode::OK { return Ok(true); }
+    if status != StatusCode::PARTIAL_CONTENT {
+        return Err(format!("Cannot resume at byte {offset}: server returned HTTP {status}"));
+    }
+    let value = content_range.ok_or("Missing Content-Range on resumed download")?;
+    let (bounds, size) = value.strip_prefix("bytes ").and_then(|v| v.split_once('/'))
+        .ok_or("Invalid Content-Range on resumed download")?;
+    let (start, end) = bounds.split_once('-').ok_or("Invalid range boundaries")?;
+    let start = start.parse::<u64>().map_err(|_| "Invalid start of Content-Range")?;
+    let end = end.parse::<u64>().map_err(|_| "Invalid end of Content-Range")?;
+    if start != offset || end < start {
+        return Err(format!("Unexpected Content-Range {value}, requested byte {offset}"));
+    }
+    if size != "*" {
+        let remote_size = size.parse::<u64>().map_err(|_| "Invalid total in Content-Range")?;
+        if let Some(expected) = expected_size {
+            if remote_size != expected { return Err("Remote file changed during resume; rescan the folder".into()); }
+        }
+        if end >= remote_size { return Err("Content-Range exceeds remote file length".into()); }
+    }
+    Ok(false)
+}
+
+// Receipts allow idempotent retries for Workspace exports, which have no Drive MD5 or size.
+fn receipt_path(root: &Path, file: &DownloadItem) -> PathBuf {
+    let digest = Sha256::digest(file.relative_path.as_bytes());
+    root.join(".north-drive-state").join(format!("{digest:x}.json"))
+}
+async fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut f = async_fs::File::open(path).await.map_err(|e| e.to_string())?;
+    let mut sha = Sha256::new();
+    let mut buffer = [0u8; 128 * 1024];
+    loop {
+        let n = f.read(&mut buffer).await.map_err(|e| e.to_string())?;
+        if n == 0 { break; }
+        sha.update(&buffer[..n]);
+    }
+    Ok(format!("{:x}", sha.finalize()))
+}
+fn receipt_source(file: &DownloadItem) -> serde_json::Value {
+    // Keep the partial-file fingerprint backward compatible with 0.1.2.
+    serde_json::json!({"id":file.id,"size":file.size,"md5":file.md5_checksum,"mime":file.mime_type,"export":file.export_mime})
+}
+fn completed_source(file: &DownloadItem) -> serde_json::Value {
+    serde_json::json!({"source":receipt_source(file),"modifiedTime":file.modified_time})
+}
+async fn previously_verified(root: &Path, file: &DownloadItem, target: &Path) -> Result<bool, String> {
+    if !target.is_file() { return Ok(false); }
+    let len = async_fs::metadata(target).await.map_err(|e| e.to_string())?.len();
+    if file.md5_checksum.as_ref().is_some_and(|sum| file.size == Some(len) && sum.len() == 32) {
+        return verify_md5(target, file.md5_checksum.as_ref().unwrap()).await;
+    }
+    if file.export_mime.is_some() {
+        let receipt = match async_fs::read(receipt_path(root, file)).await {
+            Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes).ok(),
+            Err(_) => None,
+        };
+        if let Some(saved) = receipt {
+            if saved.get("source") == Some(&completed_source(file))
+                && saved.get("length").and_then(|v| v.as_u64()) == Some(len) {
+                let actual_hash = sha256_file(target).await?;
+                if saved.get("sha256").and_then(|v| v.as_str()) == Some(actual_hash.as_str()) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+async fn record_export_completion(root: &Path, file: &DownloadItem, target: &Path, length: u64) -> Result<(), String> {
+    if file.export_mime.is_none() { return Ok(()); }
+    let path = receipt_path(root, file);
+    let dir = path.parent().ok_or("Invalid receipt directory")?;
+    async_fs::create_dir_all(dir).await.map_err(|e| e.to_string())?;
+    let payload = serde_json::json!({
+        "source": completed_source(file), "length": length, "sha256": sha256_file(target).await?
+    });
+    let bytes = serde_json::to_vec(&payload).map_err(|e| e.to_string())?;
+    let temp = path.with_extension("json.tmp");
+    async_fs::write(&temp, bytes).await.map_err(|e| e.to_string())?;
+    async_fs::rename(&temp, &path).await.map_err(|e| e.to_string())
+}
+
+async fn download_one(app: &AppHandle, client: &Client, access: &Access, file: &DownloadItem, root: &Path, control: &RunControl) -> Result<(), String> {
     let relative = safe_relative(&file.relative_path)?;
     let target = root.join(relative);
     if let Some(parent) = target.parent() { async_fs::create_dir_all(parent).await.map_err(|e| e.to_string())?; }
-    // Skip only previously verified matching files. Never overwrite other files silently.
     if target.exists() {
-        if file.md5_checksum.as_ref().is_some_and(|sum| file.size == fs::metadata(&target).ok().map(|m| m.len()) && sum.len() == 32) {
-            if verify_md5(&target, file.md5_checksum.as_ref().unwrap()).await? {
-                progress(app, file, file.size.unwrap_or(0), "completed", 0.0, Some("Already verified".into()));
-                return Ok(());
-            }
+        if previously_verified(root, file, &target).await? {
+            progress(app, file, file.size.unwrap_or(fs::metadata(&target).map(|m| m.len()).unwrap_or(0)), "completed", 0.0, Some("Already verified".into()));
+            return Ok(());
         }
         return Err(format!("Existing destination file differs: {}. Move or rename it before downloading", target.display()));
     }
     let (part, meta) = part_paths(&target);
-    let fingerprint = serde_json::json!({"id":file.id,"size":file.size,"md5":file.md5_checksum,"mime":file.mime_type,"export":file.export_mime});
-    let expected = serde_json::to_vec(&fingerprint).map_err(|e| e.to_string())?;
+    let expected = serde_json::to_vec(&receipt_source(file)).map_err(|e| e.to_string())?;
     if part.exists() {
         if fs::read(&meta).ok().as_deref() != Some(expected.as_slice()) {
             return Err(format!("Partial file metadata does not match source: {}. Remove the .northpart files to restart", target.display()));
         }
     } else { async_fs::write(&meta, &expected).await.map_err(|e| e.to_string())?; }
-    let mut attempt = 0;
+    let mut attempt = 0u32;
+    let mut checksum_resets = 0u32;
     loop {
         wait_for_run(control).await?;
         attempt += 1;
-        let result = download_attempt(app, client, prefs, auth_cache, file, &part, control).await;
+        let mut result = download_attempt(app, client, access, file, &part, control).await;
+        if result.is_ok() {
+            match async_fs::metadata(&part).await {
+                Ok(m) => {
+                    let length = m.len();
+                    if file.size.is_some_and(|size| length != size) {
+                        result = Err(format!("Incomplete transfer: expected {} bytes, received {length}", file.size.unwrap_or(0)));
+                    } else if let Some(checksum) = &file.md5_checksum {
+                        progress(app, file, length, "verifying", 0.0, None);
+                        match verify_md5(&part, checksum).await {
+                            Ok(true) => {}
+                            Ok(false) if checksum_resets == 0 => {
+                                checksum_resets += 1;
+                                match async_fs::remove_file(&part).await {
+                                    Ok(()) => result = Err("MD5 checksum mismatch; retrying a fresh copy".into()),
+                                    Err(e) => result = Err(format!("Cannot reset corrupt partial: {e}")),
+                                }
+                            }
+                            Ok(false) => result = Err("MD5 checksum mismatch after clean retry; rescan the folder".into()),
+                            Err(e) => result = Err(format!("Cannot verify MD5: {e}")),
+                        }
+                    }
+                }
+                Err(e) => result = Err(format!("Cannot inspect partial file: {e}")),
+            }
+        }
         match result {
             Ok(()) => break,
             Err(e) => {
                 if control.cancelled.load(Ordering::SeqCst) { return Err("Cancelled".into()); }
-                if attempt >= 5 { return Err(format!("{} (after {attempt} attempts)", e)); }
-                progress(app, file, fs::metadata(&part).map(|m|m.len()).unwrap_or(0), "retrying", 0.0, Some(format!("Retry {attempt}/4: {e}")));
-                sleep(Duration::from_secs((1u64 << attempt).min(30))).await;
+                if attempt >= 8 || !retryable_transfer_error(&e) {
+                    return Err(format!("{e} (attempt {attempt}/8; partial download preserved)"));
+                }
+                let backoff = (1u64 << attempt.min(6)).min(45);
+                progress(app, file, fs::metadata(&part).map(|m| m.len()).unwrap_or(0),
+                    "retrying", 0.0, Some(format!("Retry {attempt}/7 in {backoff}s: {e}")));
+                // Poll cancellation while sleeping instead of trapping users in long backoffs.
+                for _ in 0..(backoff * 4) {
+                    wait_for_run(control).await?;
+                    sleep(Duration::from_millis(250)).await;
+                }
             }
         }
     }
     let length = fs::metadata(&part).map_err(|e| e.to_string())?.len();
-    if let Some(size) = file.size { if length != size { return Err(format!("Downloaded size mismatch: expected {size}, got {length}")); } }
-    if let Some(expected) = &file.md5_checksum {
-        progress(app, file, length, "verifying", 0.0, None);
-        if !verify_md5(&part, expected).await? { return Err("MD5 checksum mismatch. Partial file kept for inspection".into()); }
-    }
-    // Check for a conflicting destination again before finalizing.
     if target.exists() { return Err(format!("Destination appeared during transfer: {}", target.display())); }
-    // Same-directory rename is atomic on typical macOS volumes.
     async_fs::rename(&part, &target).await.map_err(|e| e.to_string())?;
     let _ = async_fs::remove_file(meta).await;
+    // A receipt failure must not mark an otherwise verified file as failed.
+    let _ = record_export_completion(root, file, &target, length).await;
     progress(app, file, length, "completed", 0.0, None);
     Ok(())
 }
-async fn download_attempt(app: &AppHandle, client: &Client, prefs: &Preferences, auth_cache: &AuthCache, file: &DownloadItem, path: &Path, control: &RunControl) -> Result<(), String> {
+
+async fn download_attempt(app: &AppHandle, client: &Client, access: &Access, file: &DownloadItem, path: &Path, control: &RunControl) -> Result<(), String> {
     let mut offset = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    // Google Workspace exports do not support byte ranges, so restart any partial export.
+    // Google Workspace exports do not support byte ranges; partial exports must restart.
     if file.export_mime.is_some() && offset > 0 {
         async_fs::remove_file(path).await.map_err(|e| e.to_string())?;
         offset = 0;
     }
+    if file.size.is_some_and(|size| offset > size) {
+        async_fs::remove_file(path).await.map_err(|e| e.to_string())?;
+        offset = 0;
+    }
     if file.size == Some(offset) && offset > 0 { return Ok(()); }
-    let endpoint = if let Some(mime) = &file.export_mime {
-        let _ = mime;
+    let endpoint = if file.export_mime.is_some() {
         format!("{DRIVE_BASE}/{}/export", file.id)
     } else { format!("{DRIVE_BASE}/{}", file.id) };
-    // Share a cached OAuth token across concurrent file transfers; refresh before expiry.
-    let auth = current_access(auth_cache, client, prefs).await?;
-    let mut req = auth.request(client, &endpoint);
-    if let Some(mime) = &file.export_mime { req = req.query(&[("mimeType",mime.as_str())]); }
-    else { req = req.query(&[("alt","media"), ("supportsAllDrives", "true")]); }
-    if let Some(key) = &file.resource_key { req = req.header("X-Goog-Drive-Resource-Keys",format!("{}/{}",file.id,key)); }
+    let mut req = access.request(client, &endpoint);
+    if let Some(mime) = &file.export_mime { req = req.query(&[("mimeType", mime.as_str())]); }
+    else { req = req.query(&[("alt", "media"), ("supportsAllDrives", "true")]); }
+    if let Some(key) = &file.resource_key { req = req.header("X-Goog-Drive-Resource-Keys", format!("{}/{}", file.id, key)); }
     if offset > 0 { req = req.header(header::RANGE, format!("bytes={offset}-")); }
-    let mut response = req.send().await.map_err(|e| e.to_string())?;
-    if response.status() == StatusCode::UNAUTHORIZED { expire_access(auth_cache).await; return Err("Google session expired; retrying with fresh token".into()); }
-    if offset > 0 {
-        if response.status() != StatusCode::PARTIAL_CONTENT {
-            return Err(format!("Server did not honor resume range (HTTP {})", response.status()));
-        }
-        let range = response.headers().get(header::CONTENT_RANGE).and_then(|v|v.to_str().ok()).unwrap_or("");
-        if !range.starts_with(&format!("bytes {offset}-")) { return Err("Server returned unexpected content range".into()); }
-    } else if !response.status().is_success() {
+    let mut response = req.send().await.map_err(|e| format!("Network error starting transfer: {e}"))?;
+    if !response.status().is_success() {
         let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(format!("Google Drive HTTP {status}: {}",text.chars().take(180).collect::<String>()));
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Google Drive HTTP {}: {}", status.as_u16(), body.chars().take(400).collect::<String>()));
     }
-    let mut f = async_fs::OpenOptions::new().create(true).append(true).open(path).await.map_err(|e| e.to_string())?;
-    let started = Instant::now(); let mut bytes = offset; let mut last_update = Instant::now();
+    let restart = validate_resume_response(
+        offset, response.status(), response.headers().get(header::CONTENT_RANGE).and_then(|h| h.to_str().ok()), file.size,
+    )?;
+    if restart {
+        // Server ignored Range (HTTP 200); truncate instead of corrupting by appending.
+        offset = 0;
+    }
+    let expected_response_len = response.content_length();
+    let mut f = async_fs::OpenOptions::new().create(true).write(true).append(!restart)
+        .truncate(restart).open(path).await.map_err(|e| e.to_string())?;
+    let started = Instant::now();
+    let mut bytes = offset;
+    let mut last_update = Instant::now();
     progress(app, file, bytes, "downloading", 0.0, None);
-    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+    loop {
+        let chunk = tokio::time::timeout(Duration::from_secs(120), response.chunk()).await
+            .map_err(|_| "Network stalled for 120 seconds; resuming transfer".to_string())?
+            .map_err(|e| format!("Transfer interrupted: {e}"))?;
+        let Some(chunk) = chunk else { break; };
         wait_for_run(control).await?;
-        f.write_all(&chunk).await.map_err(|e| e.to_string())?;
+        f.write_all(&chunk).await.map_err(|e| format!("Cannot write downloaded file (check disk space): {e}"))?;
         bytes += chunk.len() as u64;
         if last_update.elapsed() >= Duration::from_millis(280) {
-            let rate = (bytes-offset) as f64 / started.elapsed().as_secs_f64().max(0.001);
+            let rate = (bytes - offset) as f64 / started.elapsed().as_secs_f64().max(0.001);
             progress(app, file, bytes, "downloading", rate, None);
             last_update = Instant::now();
         }
     }
     f.flush().await.map_err(|e| e.to_string())?;
+    if let Some(expected) = expected_response_len {
+        if bytes - offset != expected {
+            return Err(format!("Incomplete HTTP response: expected {expected} bytes, received {}", bytes - offset));
+        }
+    }
     progress(app, file, bytes, "downloading", 0.0, None);
     Ok(())
 }
@@ -521,6 +575,8 @@ async fn download_attempt(app: &AppHandle, client: &Client, prefs: &Preferences,
 #[tauri::command]
 async fn start_download(app: AppHandle, state: State<'_, Arc<AppState>>, plan: FolderPlan, directory: String) -> Result<(), String> {
     let prefs = state.prefs.lock().unwrap().clone();
+    if plan.access_method != "public" { return Err("Only publicly accessible Google Drive folders are supported".into()); }
+    if prefs.api_key.trim().is_empty() { return Err("Add a Google Drive API key in Settings before downloading a public folder".into()); }
     let destination = PathBuf::from(directory.trim());
     if !destination.is_absolute() || !destination.is_dir() { return Err("Choose an existing absolute destination folder".into()); }
     let mut seen = HashSet::new();
@@ -536,9 +592,11 @@ async fn start_download(app: AppHandle, state: State<'_, Arc<AppState>>, plan: F
     let state_handle = state.inner().clone();
     tauri::async_runtime::spawn(async move {
         let result = download_folder(&app_handle, &client, &prefs, &plan, &destination, &run).await;
+        {
+            let mut active = state_handle.run.lock().unwrap();
+            if active.as_ref().is_some_and(|existing| Arc::ptr_eq(existing, &run)) { *active = None; }
+        }
         let _ = app_handle.emit("north:summary", result);
-        let mut active = state_handle.run.lock().unwrap();
-        if active.as_ref().is_some_and(|existing| Arc::ptr_eq(existing, &run)) { *active = None; }
     });
     Ok(())
 }
@@ -552,9 +610,7 @@ async fn download_folder(app: &AppHandle, client: &Client, prefs: &Preferences, 
             Err(e) => errors.push(e)
         }
     }
-    let access = if plan.access_method == "public" && !prefs.api_key.is_empty() { Access::Public(prefs.api_key.clone()) }
-        else { match refresh_access_token(client, prefs).await { Ok(t) => Access::OAuth(t), Err(e) => return RunSummary{completed:0,failed:plan.files.len(),cancelled:false,errors:vec![e]} } };
-    let auth_cache: AuthCache = Arc::new(tokio::sync::Mutex::new((Instant::now(), access)));
+    let access = Arc::new(Access { api_key: prefs.api_key.clone() });
     let mut tasks = tokio::task::JoinSet::new();
     let mut completed = 0; let mut failed = 0;
     let max_parallel = prefs.max_parallel.clamp(1,8);
@@ -566,10 +622,10 @@ async fn download_folder(app: &AppHandle, client: &Client, prefs: &Preferences, 
                 match joined { Ok(Ok(()))=>completed+=1, Ok(Err(e))=>{failed+=1;errors.push(e)}, Err(e)=>{failed+=1;errors.push(e.to_string())} }
             }
         }
-        let app = app.clone(); let root = root.clone(); let client = client.clone(); let prefs = prefs.clone(); let auth_cache = auth_cache.clone();
+        let app = app.clone(); let root = root.clone(); let client = client.clone(); let access = access.clone();
         let control = run.clone();
         tasks.spawn(async move {
-            let result = download_one(&app, &client, &prefs, &auth_cache, &file, &root, &control).await;
+            let result = download_one(&app, &client, &access, &file, &root, &control).await;
             if let Err(ref e) = result {
                 let partial_bytes = safe_relative(&file.relative_path).ok()
                     .map(|p| part_paths(&root.join(p)).0)
@@ -601,11 +657,11 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let prefs = read_prefs(app.handle());
-            let client = Client::builder().connect_timeout(Duration::from_secs(25)).build()?;
+            let client = Client::builder().connect_timeout(Duration::from_secs(25)).pool_idle_timeout(Duration::from_secs(60)).build()?;
             app.manage(Arc::new(AppState { prefs: Mutex::new(prefs), run: Mutex::new(None), client }));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_preferences, set_preferences, is_connected, connect_google, disconnect, scan_folder, start_download, pause_download, cancel_download])
+        .invoke_handler(tauri::generate_handler![get_preferences, set_preferences, scan_folder, start_download, pause_download, cancel_download])
         .run(tauri::generate_context!())
         .expect("Failed to start North Drive Downloader");
 }
@@ -617,7 +673,43 @@ mod tests {
         let (id,k)=parse_drive_link("https://drive.google.com/drive/u/0/folders/1aBcD_efGh1234?resourcekey=0-secret").unwrap();
         assert_eq!(id,"1aBcD_efGh1234"); assert_eq!(k.as_deref(),Some("0-secret"));
     }
-    #[test] fn rejects_wrong_host() {assert!(parse_drive_link("https://evil.com/drive/folders/12345678").is_err());}
+    #[test] fn rejects_wrong_host() {assert!(parse_drive_link("https://evil.com/drive/folders/12345678").is_err());assert!(parse_drive_link("http://drive.google.com/drive/folders/12345678").is_err());}
     #[test] fn rejects_path_traversal() { assert!(safe_relative("../footage.mov").is_err()); assert!(safe_relative("A/B.mov").is_ok()); }
     #[test] fn collision_names() {let mut seen=HashSet::new();assert_eq!(unique_name("A.mov",&mut seen),"A.mov");assert_eq!(unique_name("a.MOV",&mut seen),"a (2).MOV");}
+
+    #[test] fn resumed_ranges_are_checked() {
+        assert_eq!(validate_resume_response(0, StatusCode::OK, None, Some(100)).unwrap(), false);
+        assert_eq!(validate_resume_response(50, StatusCode::PARTIAL_CONTENT, Some("bytes 50-99/100"), Some(100)).unwrap(), false);
+        assert_eq!(validate_resume_response(50, StatusCode::OK, None, Some(100)).unwrap(), true);
+        assert!(validate_resume_response(50, StatusCode::PARTIAL_CONTENT, Some("bytes 0-49/100"), Some(100)).is_err());
+        assert!(validate_resume_response(50, StatusCode::PARTIAL_CONTENT, Some("bytes 50-99/200"), Some(100)).is_err());
+        assert!(validate_resume_response(50, StatusCode::PARTIAL_CONTENT, None, Some(100)).is_err());
+    }
+
+    #[test] fn public_requests_never_send_google_login_tokens() {
+        let client = Client::new();
+        let access = Access { api_key: "test-public-api-key".into() };
+        let request = access.request(&client, DRIVE_BASE).build().unwrap();
+        assert!(request.headers().get(header::AUTHORIZATION).is_none());
+        assert!(request.url().query_pairs().any(|(k,v)| k == "key" && v == "test-public-api-key"));
+    }
+    #[tokio::test]
+    async fn missing_api_key_fails_without_login_attempt() {
+        let result = resolve_access(&Client::new(), &Preferences::default(), "validFolderId99", &None).await;
+        assert!(result.is_err());
+        assert!(result.err().unwrap().contains("API key"));
+    }
+    #[test] fn legacy_preferences_ignore_oauth_settings() {
+        let parsed: Preferences = serde_json::from_str(r#"{"apiKey":"test-key","clientId":"legacy-client","saveDirectory":"/tmp","maxParallel":2}"#).unwrap();
+        assert_eq!(parsed.api_key, "test-key");
+        assert_eq!(parsed.max_parallel, 2);
+        assert!(!serde_json::to_string(&parsed).unwrap().contains("clientId"));
+    }
+    #[test] fn retryable_errors_are_classified() {
+        assert!(retryable_transfer_error("Network stalled for 120 seconds"));
+        assert!(retryable_transfer_error("Google Drive HTTP 429: rateLimitExceeded"));
+        assert!(retryable_transfer_error("Google Drive HTTP 403: userRateLimitExceeded"));
+        assert!(!retryable_transfer_error("Google Drive HTTP 403: insufficientFilePermissions"));
+        assert!(!retryable_transfer_error("Google Drive HTTP 404: not found"));
+    }
 }
