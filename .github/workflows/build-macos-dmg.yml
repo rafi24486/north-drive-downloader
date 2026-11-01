@@ -3,12 +3,15 @@ on:
   push:
     branches: [main, "fix/**"]
     tags: ['v*']
-  pull_request:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# Build only the latest commit on a branch to avoid duplicate DMGs.
+concurrency:
+  group: macos-dmg-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   dmg:
