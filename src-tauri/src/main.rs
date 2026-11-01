@@ -3,7 +3,7 @@
 use reqwest::{header, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::{HashMap, HashSet, VecDeque}, fs, io, path::{Component, Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}, time::{Duration, Instant}};
+use std::{collections::{HashMap, HashSet, VecDeque}, fs, path::{Component, Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}, time::{Duration, Instant}};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::{fs as async_fs, io::{AsyncReadExt, AsyncWriteExt}, time::sleep};
 
@@ -684,6 +684,20 @@ mod tests {
         assert!(validate_resume_response(50, StatusCode::PARTIAL_CONTENT, Some("bytes 0-49/100"), Some(100)).is_err());
         assert!(validate_resume_response(50, StatusCode::PARTIAL_CONTENT, Some("bytes 50-99/200"), Some(100)).is_err());
         assert!(validate_resume_response(50, StatusCode::PARTIAL_CONTENT, None, Some(100)).is_err());
+    }
+
+    #[test] fn public_requests_never_send_google_login_tokens() {
+        let client = Client::new();
+        let access = Access { api_key: "test-public-api-key".into() };
+        let request = access.request(&client, DRIVE_BASE).build().unwrap();
+        assert!(request.headers().get(header::AUTHORIZATION).is_none());
+        assert!(request.url().query_pairs().any(|(k,v)| k == "key" && v == "test-public-api-key"));
+    }
+    #[tokio::test]
+    async fn missing_api_key_fails_without_login_attempt() {
+        let result = resolve_access(&Client::new(), &Preferences::default(), "validFolderId99", &None).await;
+        assert!(result.is_err());
+        assert!(result.err().unwrap().contains("API key"));
     }
     #[test] fn legacy_preferences_ignore_oauth_settings() {
         let parsed: Preferences = serde_json::from_str(r#"{"apiKey":"test-key","clientId":"legacy-client","saveDirectory":"/tmp","maxParallel":2}"#).unwrap();
