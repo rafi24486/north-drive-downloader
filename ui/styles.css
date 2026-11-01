@@ -20,3 +20,6 @@
 
 /* 1.0: surface the actual failure instead of hiding it in a hover tooltip. */
 .transfer-errors{border:1px solid #9c3c63;border-radius:13px;background:#351723aa;margin:12px 0 18px;padding:13px 17px;color:#ffb1c8;font-size:12px;overflow-wrap:anywhere}.transfer-errors summary{cursor:pointer;font-weight:700}.transfer-errors p{color:#ffb6c8;margin:10px 0 0;line-height:1.5}.file-error{display:block;color:#fa7b9f!important;font-size:10px!important;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:380px}
+
+/* v1 public-only UI, no account or OAuth controls. */
+.public-only-pill{height:43px;min-width:0;display:flex;align-items:center;justify-content:center;border:1px solid #384c43;background:#132b257a;color:#a3edc2;padding:0 16px;border-radius:11px;font-size:11px;font-weight:650;white-space:nowrap}
