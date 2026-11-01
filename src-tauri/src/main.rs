@@ -1,31 +1,26 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use rand::RngCore;
 use reqwest::{header, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::{HashMap, HashSet, VecDeque}, fs, io, path::{Component, Path, PathBuf}, process::Command, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}, time::{Duration, Instant}};
+use std::{collections::{HashMap, HashSet, VecDeque}, fs, io, path::{Component, Path, PathBuf}, sync::{atomic::{AtomicBool, Ordering}, Arc, Mutex}, time::{Duration, Instant}};
 use tauri::{AppHandle, Emitter, Manager, State};
-use tokio::{fs as async_fs, io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, time::sleep};
+use tokio::{fs as async_fs, io::{AsyncReadExt, AsyncWriteExt}, time::sleep};
 
 const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
 const DRIVE_BASE: &str = "https://www.googleapis.com/drive/v3/files";
-const SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
-const KEYCHAIN_SERVICE: &str = "com.northdrive.downloader.oauth";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Preferences {
     api_key: String,
-    client_id: String,
     save_directory: String,
     max_parallel: usize,
 }
 impl Default for Preferences {
     fn default() -> Self {
-        Self { api_key: String::new(), client_id: String::new(), save_directory: String::new(), max_parallel: 4 }
+        Self { api_key: String::new(), save_directory: String::new(), max_parallel: 4 }
     }
 }
 
@@ -93,36 +88,12 @@ struct Capabilities { can_download: Option<bool> }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FilePage { #[serde(default)] files: Vec<DriveFile>, next_page_token: Option<String> }
-#[derive(Deserialize)]
-struct OAuthToken { access_token: String, refresh_token: Option<String> }
-
+// This release never stores or sends Google account credentials.
 #[derive(Clone)]
-enum Access { Public(String), OAuth(String) }
+struct Access { api_key: String }
 impl Access {
-    fn method(&self) -> &'static str { match self { Access::Public(_) => "public", Access::OAuth(_) => "oauth" } }
     fn request(&self, client: &Client, url: &str) -> reqwest::RequestBuilder {
-        match self {
-            Access::Public(key) => client.get(url).query(&[("key", key.as_str())]),
-            Access::OAuth(token) => client.get(url).bearer_auth(token),
-        }
-    }
-}
-
-type AuthCache = Arc<tokio::sync::Mutex<(Instant, Access)>>;
-
-async fn current_access(cache: &AuthCache, client: &Client, prefs: &Preferences) -> Result<Access, String> {
-    let mut stored = cache.lock().await;
-    if matches!(stored.1, Access::OAuth(_)) && stored.0.elapsed() > Duration::from_secs(45 * 60) {
-        stored.1 = Access::OAuth(refresh_access_token(client, prefs).await?);
-        stored.0 = Instant::now();
-    }
-    Ok(stored.1.clone())
-}
-
-async fn expire_access(cache: &AuthCache) {
-    let mut stored = cache.lock().await;
-    if matches!(stored.1, Access::OAuth(_)) {
-        stored.0 = Instant::now() - Duration::from_secs(3600);
+        client.get(url).query(&[("key", self.api_key.as_str())])
     }
 }
 
@@ -139,104 +110,20 @@ fn persist_prefs(app: &AppHandle, prefs: &Preferences) -> Result<(), String> {
 fn read_prefs(app: &AppHandle) -> Preferences {
     config_file(app).ok().and_then(|p| fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
-fn keychain_entry() -> Result<keyring::Entry, String> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, "refresh-token").map_err(|e| e.to_string())
-}
-fn has_login() -> bool { keychain_entry().and_then(|e| e.get_password().map_err(|x| x.to_string())).is_ok() }
-
 #[tauri::command]
 fn get_preferences(state: State<'_, Arc<AppState>>) -> Preferences { state.prefs.lock().unwrap().clone() }
 #[tauri::command]
-fn is_connected() -> bool { has_login() }
-#[tauri::command]
 fn set_preferences(app: AppHandle, state: State<'_, Arc<AppState>>, preferences: Preferences) -> Result<(), String> {
     if preferences.max_parallel == 0 || preferences.max_parallel > 8 { return Err("Parallel downloads must be between 1 and 8".into()); }
-    let preferences = Preferences { api_key: preferences.api_key.trim().to_string(), client_id: preferences.client_id.trim().to_string(), save_directory: preferences.save_directory.trim().to_string(), max_parallel: preferences.max_parallel };
+    let preferences = Preferences { api_key: preferences.api_key.trim().to_string(), save_directory: preferences.save_directory.trim().to_string(), max_parallel: preferences.max_parallel };
     persist_prefs(&app, &preferences)?;
     *state.prefs.lock().unwrap() = preferences;
     Ok(())
 }
-#[tauri::command]
-fn disconnect() -> Result<(), String> {
-    match keychain_entry()?.delete_credential() { Ok(_) => Ok(()), Err(e) if e.to_string().contains("No matching") => Ok(()), Err(e) => Err(e.to_string()) }
-}
-
-fn new_verifier() -> (String, String, String) {
-    let mut raw = [0u8; 32]; rand::rngs::OsRng.fill_bytes(&mut raw);
-    let verifier = URL_SAFE_NO_PAD.encode(raw);
-    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-    rand::rngs::OsRng.fill_bytes(&mut raw);
-    (verifier, challenge, URL_SAFE_NO_PAD.encode(raw))
-}
-
-#[tauri::command]
-async fn connect_google(state: State<'_, Arc<AppState>>) -> Result<String, String> {
-    let client_id = state.prefs.lock().unwrap().client_id.clone();
-    if client_id.is_empty() { return Err("Add your Google OAuth Desktop Client ID in Settings first".into()); }
-    let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|e| e.to_string())?;
-    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
-    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
-    let (verifier, challenge, state_code) = new_verifier();
-    let mut authorize = url::Url::parse("https://accounts.google.com/o/oauth2/v2/auth").unwrap();
-    authorize.query_pairs_mut()
-        .append_pair("client_id", &client_id)
-        .append_pair("redirect_uri", &redirect_uri)
-        .append_pair("response_type", "code")
-        .append_pair("scope", SCOPE)
-        .append_pair("access_type", "offline")
-        .append_pair("prompt", "consent")
-        .append_pair("code_challenge", &challenge)
-        .append_pair("code_challenge_method", "S256")
-        .append_pair("state", &state_code);
-    Command::new("open").arg(authorize.as_str()).spawn().map_err(|e| format!("Cannot open browser: {e}"))?;
-    let code = tokio::time::timeout(Duration::from_secs(180), async {
-        loop {
-            let (mut stream, addr) = listener.accept().await.map_err(|e| e.to_string())?;
-            if !addr.ip().is_loopback() { continue; }
-            let mut buf = [0u8; 4096];
-            let n = stream.read(&mut buf).await.map_err(|e| e.to_string())?;
-            let req = String::from_utf8_lossy(&buf[..n]);
-            let target = req.lines().next().and_then(|s| s.split_whitespace().nth(1)).ok_or("Invalid callback")?;
-            let cb = url::Url::parse(&format!("http://127.0.0.1:{port}{target}")).map_err(|e| e.to_string())?;
-            if cb.path() != "/callback" { continue; }
-            let params: HashMap<String,String> = cb.query_pairs().into_owned().collect();
-            let valid = params.get("state") == Some(&state_code);
-            let success = valid && params.contains_key("code");
-            let message = if success { "Google connected. You can close this tab and return to North Drive Downloader." } else { "Authorization failed. Return to North Drive Downloader." };
-            let body = format!("<html><body style='font-family:-apple-system;background:#0c0912;color:#fff;text-align:center;padding:100px'><h2>{message}</h2></body></html>");
-            let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
-            let _ = stream.write_all(response.as_bytes()).await;
-            if !valid { return Err("OAuth state mismatch".into()); }
-            if let Some(error) = params.get("error") { return Err(format!("Google authorization denied: {error}")); }
-            return params.get("code").cloned().ok_or_else(|| "Missing authorization code".to_string());
-        }
-    }).await.map_err(|_| "Google sign-in timed out".to_string())??;
-    let response = state.client.post("https://oauth2.googleapis.com/token").form(&[
-        ("code", code.as_str()), ("client_id", client_id.as_str()), ("code_verifier", verifier.as_str()),
-        ("redirect_uri", redirect_uri.as_str()), ("grant_type", "authorization_code")
-    ]).send().await.map_err(|e| e.to_string())?;
-    if !response.status().is_success() { return Err(format!("Google sign-in failed: {}", response.text().await.unwrap_or_default())); }
-    let token: OAuthToken = response.json().await.map_err(|e| e.to_string())?;
-    let refresh = token.refresh_token.ok_or("Google did not return a refresh token; revoke access and retry")?;
-    keychain_entry()?.set_password(&refresh).map_err(|e| e.to_string())?;
-    Ok("Google account connected".into())
-}
-
-async fn refresh_access_token(client: &Client, prefs: &Preferences) -> Result<String, String> {
-    if prefs.client_id.is_empty() { return Err("OAuth Client ID not configured".into()); }
-    let refresh = keychain_entry()?.get_password().map_err(|_| "Google account not connected. Go to Accounts and sign in".to_string())?;
-    let response = client.post("https://oauth2.googleapis.com/token").form(&[
-        ("client_id", prefs.client_id.as_str()), ("refresh_token", refresh.as_str()), ("grant_type", "refresh_token")
-    ]).send().await.map_err(|e| e.to_string())?;
-    if !response.status().is_success() { return Err("Google session expired or was revoked. Reconnect your account".into()); }
-    let token: OAuthToken = response.json().await.map_err(|e| e.to_string())?;
-    Ok(token.access_token)
-}
-
 fn parse_drive_link(link: &str) -> Result<(String, Option<String>), String> {
     let url = url::Url::parse(link.trim()).map_err(|_| "Paste a complete Google Drive folder URL".to_string())?;
     let domain = url.host_str().unwrap_or("");
-    if domain != "drive.google.com" && domain != "docs.google.com" { return Err("Only Google Drive URLs are supported".into()); }
+    if url.scheme() != "https" || (domain != "drive.google.com" && domain != "docs.google.com") { return Err("Only secure Google Drive URLs are supported".into()); }
     let pieces: Vec<_> = url.path_segments().map(|s| s.collect()).unwrap_or_else(Vec::new);
     let id: Option<String> = if let Some(i) = pieces.iter().position(|p| *p == "folders") {
         pieces.get(i + 1).map(|value| (*value).to_string())
@@ -309,22 +196,19 @@ async fn metadata(client: &Client, access: &Access, id: &str, keys: &HashMap<Str
     ], keys).await
 }
 async fn resolve_access(client: &Client, prefs: &Preferences, id: &str, rk: &Option<String>) -> Result<(Access, DriveFile), String> {
-    let mut keys = HashMap::new(); if let Some(k) = rk { keys.insert(id.to_string(), k.clone()); }
-    let mut public_err = String::new();
-    if !prefs.api_key.is_empty() {
-        let public = Access::Public(prefs.api_key.clone());
-        match metadata(client, &public, id, &keys).await {
-            Ok(meta) => return Ok((public,meta)), Err(err) => public_err = err
-        }
+    let api_key = prefs.api_key.trim();
+    if api_key.is_empty() {
+        return Err("To scan public Google Drive folders without signing in, add a Google Drive API key in Settings. No Google account login is required.".into());
     }
-    if has_login() {
-        let oauth = Access::OAuth(refresh_access_token(client, prefs).await?);
-        let meta = metadata(client, &oauth, id, &keys).await?;
-        return Ok((oauth, meta));
-    }
-    Err(if prefs.api_key.is_empty() {
-        "Configure a Google Drive API key for public links, or connect your Google account for restricted links".into()
-    } else { format!("Public access failed: {public_err}. If this is restricted, connect an authorized Google account") })
+    let mut keys = HashMap::new();
+    if let Some(k) = rk { keys.insert(id.to_string(), k.clone()); }
+    let access = Access { api_key: api_key.to_string() };
+    let meta = metadata(client, &access, id, &keys).await.map_err(|error| {
+        if error.contains("HTTP 401") || error.contains("HTTP 403") || error.contains("HTTP 404") {
+            format!("This folder cannot be accessed publicly. Set Google Drive sharing to 'Anyone with the link' and verify your API key. Details: {error}")
+        } else { error }
+    })?;
+    Ok((access, meta))
 }
 fn workspace_export(mime: &str) -> Option<(&'static str, &'static str)> {
     match mime {
@@ -400,7 +284,7 @@ async fn scan_folder(link: String, state: State<'_, Arc<AppState>>) -> Result<Fo
         }
         if !found_children && !parent_path.is_empty() { empty_folders.push(parent_path); }
     }
-    Ok(FolderPlan { folder_id: id, folder_name: sanitized_name(&root.name), files, empty_folders, total_bytes, warnings, access_method: access.method().into(), folder_resource_key: rk.or(root.resource_key) })
+    Ok(FolderPlan { folder_id: id, folder_name: sanitized_name(&root.name), files, empty_folders, total_bytes, warnings, access_method: "public".into(), folder_resource_key: rk.or(root.resource_key) })
 }
 
 fn safe_relative(raw: &str) -> Result<PathBuf, String> {
@@ -547,7 +431,7 @@ async fn record_export_completion(root: &Path, file: &DownloadItem, target: &Pat
     async_fs::rename(&temp, &path).await.map_err(|e| e.to_string())
 }
 
-async fn download_one(app: &AppHandle, client: &Client, prefs: &Preferences, auth_cache: &AuthCache, file: &DownloadItem, root: &Path, control: &RunControl) -> Result<(), String> {
+async fn download_one(app: &AppHandle, client: &Client, access: &Access, file: &DownloadItem, root: &Path, control: &RunControl) -> Result<(), String> {
     let relative = safe_relative(&file.relative_path)?;
     let target = root.join(relative);
     if let Some(parent) = target.parent() { async_fs::create_dir_all(parent).await.map_err(|e| e.to_string())?; }
@@ -570,7 +454,7 @@ async fn download_one(app: &AppHandle, client: &Client, prefs: &Preferences, aut
     loop {
         wait_for_run(control).await?;
         attempt += 1;
-        let mut result = download_attempt(app, client, prefs, auth_cache, file, &part, control).await;
+        let mut result = download_attempt(app, client, access, file, &part, control).await;
         if result.is_ok() {
             match async_fs::metadata(&part).await {
                 Ok(m) => {
@@ -624,7 +508,7 @@ async fn download_one(app: &AppHandle, client: &Client, prefs: &Preferences, aut
     Ok(())
 }
 
-async fn download_attempt(app: &AppHandle, client: &Client, prefs: &Preferences, auth_cache: &AuthCache, file: &DownloadItem, path: &Path, control: &RunControl) -> Result<(), String> {
+async fn download_attempt(app: &AppHandle, client: &Client, access: &Access, file: &DownloadItem, path: &Path, control: &RunControl) -> Result<(), String> {
     let mut offset = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     // Google Workspace exports do not support byte ranges; partial exports must restart.
     if file.export_mime.is_some() && offset > 0 {
@@ -639,17 +523,12 @@ async fn download_attempt(app: &AppHandle, client: &Client, prefs: &Preferences,
     let endpoint = if file.export_mime.is_some() {
         format!("{DRIVE_BASE}/{}/export", file.id)
     } else { format!("{DRIVE_BASE}/{}", file.id) };
-    let auth = current_access(auth_cache, client, prefs).await?;
-    let mut req = auth.request(client, &endpoint);
+    let mut req = access.request(client, &endpoint);
     if let Some(mime) = &file.export_mime { req = req.query(&[("mimeType", mime.as_str())]); }
     else { req = req.query(&[("alt", "media"), ("supportsAllDrives", "true")]); }
     if let Some(key) = &file.resource_key { req = req.header("X-Goog-Drive-Resource-Keys", format!("{}/{}", file.id, key)); }
     if offset > 0 { req = req.header(header::RANGE, format!("bytes={offset}-")); }
     let mut response = req.send().await.map_err(|e| format!("Network error starting transfer: {e}"))?;
-    if response.status() == StatusCode::UNAUTHORIZED {
-        expire_access(auth_cache).await;
-        return Err("Google session expired; refreshing credentials".into());
-    }
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
@@ -696,6 +575,8 @@ async fn download_attempt(app: &AppHandle, client: &Client, prefs: &Preferences,
 #[tauri::command]
 async fn start_download(app: AppHandle, state: State<'_, Arc<AppState>>, plan: FolderPlan, directory: String) -> Result<(), String> {
     let prefs = state.prefs.lock().unwrap().clone();
+    if plan.access_method != "public" { return Err("Only publicly accessible Google Drive folders are supported".into()); }
+    if prefs.api_key.trim().is_empty() { return Err("Add a Google Drive API key in Settings before downloading a public folder".into()); }
     let destination = PathBuf::from(directory.trim());
     if !destination.is_absolute() || !destination.is_dir() { return Err("Choose an existing absolute destination folder".into()); }
     let mut seen = HashSet::new();
@@ -729,9 +610,7 @@ async fn download_folder(app: &AppHandle, client: &Client, prefs: &Preferences, 
             Err(e) => errors.push(e)
         }
     }
-    let access = if plan.access_method == "public" && !prefs.api_key.is_empty() { Access::Public(prefs.api_key.clone()) }
-        else { match refresh_access_token(client, prefs).await { Ok(t) => Access::OAuth(t), Err(e) => return RunSummary{completed:0,failed:plan.files.len(),cancelled:false,errors:vec![e]} } };
-    let auth_cache: AuthCache = Arc::new(tokio::sync::Mutex::new((Instant::now(), access)));
+    let access = Arc::new(Access { api_key: prefs.api_key.clone() });
     let mut tasks = tokio::task::JoinSet::new();
     let mut completed = 0; let mut failed = 0;
     let max_parallel = prefs.max_parallel.clamp(1,8);
@@ -743,10 +622,10 @@ async fn download_folder(app: &AppHandle, client: &Client, prefs: &Preferences, 
                 match joined { Ok(Ok(()))=>completed+=1, Ok(Err(e))=>{failed+=1;errors.push(e)}, Err(e)=>{failed+=1;errors.push(e.to_string())} }
             }
         }
-        let app = app.clone(); let root = root.clone(); let client = client.clone(); let prefs = prefs.clone(); let auth_cache = auth_cache.clone();
+        let app = app.clone(); let root = root.clone(); let client = client.clone(); let access = access.clone();
         let control = run.clone();
         tasks.spawn(async move {
-            let result = download_one(&app, &client, &prefs, &auth_cache, &file, &root, &control).await;
+            let result = download_one(&app, &client, &access, &file, &root, &control).await;
             if let Err(ref e) = result {
                 let partial_bytes = safe_relative(&file.relative_path).ok()
                     .map(|p| part_paths(&root.join(p)).0)
@@ -782,7 +661,7 @@ fn main() {
             app.manage(Arc::new(AppState { prefs: Mutex::new(prefs), run: Mutex::new(None), client }));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_preferences, set_preferences, is_connected, connect_google, disconnect, scan_folder, start_download, pause_download, cancel_download])
+        .invoke_handler(tauri::generate_handler![get_preferences, set_preferences, scan_folder, start_download, pause_download, cancel_download])
         .run(tauri::generate_context!())
         .expect("Failed to start North Drive Downloader");
 }
@@ -794,7 +673,7 @@ mod tests {
         let (id,k)=parse_drive_link("https://drive.google.com/drive/u/0/folders/1aBcD_efGh1234?resourcekey=0-secret").unwrap();
         assert_eq!(id,"1aBcD_efGh1234"); assert_eq!(k.as_deref(),Some("0-secret"));
     }
-    #[test] fn rejects_wrong_host() {assert!(parse_drive_link("https://evil.com/drive/folders/12345678").is_err());}
+    #[test] fn rejects_wrong_host() {assert!(parse_drive_link("https://evil.com/drive/folders/12345678").is_err());assert!(parse_drive_link("http://drive.google.com/drive/folders/12345678").is_err());}
     #[test] fn rejects_path_traversal() { assert!(safe_relative("../footage.mov").is_err()); assert!(safe_relative("A/B.mov").is_ok()); }
     #[test] fn collision_names() {let mut seen=HashSet::new();assert_eq!(unique_name("A.mov",&mut seen),"A.mov");assert_eq!(unique_name("a.MOV",&mut seen),"a (2).MOV");}
 
@@ -805,6 +684,12 @@ mod tests {
         assert!(validate_resume_response(50, StatusCode::PARTIAL_CONTENT, Some("bytes 0-49/100"), Some(100)).is_err());
         assert!(validate_resume_response(50, StatusCode::PARTIAL_CONTENT, Some("bytes 50-99/200"), Some(100)).is_err());
         assert!(validate_resume_response(50, StatusCode::PARTIAL_CONTENT, None, Some(100)).is_err());
+    }
+    #[test] fn legacy_preferences_ignore_oauth_settings() {
+        let parsed: Preferences = serde_json::from_str(r#"{"apiKey":"test-key","clientId":"legacy-client","saveDirectory":"/tmp","maxParallel":2}"#).unwrap();
+        assert_eq!(parsed.api_key, "test-key");
+        assert_eq!(parsed.max_parallel, 2);
+        assert!(!serde_json::to_string(&parsed).unwrap().contains("clientId"));
     }
     #[test] fn retryable_errors_are_classified() {
         assert!(retryable_transfer_error("Network stalled for 120 seconds"));
