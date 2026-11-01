@@ -1,76 +1,42 @@
-# North Drive Downloader 1.0.0 — Reliable Transfer Release
+# North Drive Downloader 1.0.0 — Public-Only Edition
 
-A native Apple Silicon + Intel macOS Google Drive folder downloader built with Rust/Tauri.
+A native macOS Google Drive folder downloader for **publicly shared folders**, using a dark/pink Tauri UI. No Google account sign-in, OAuth client ID, account selector, or login screen.
 
-## Version 1.0 improvements
+## How to use
 
-- Detect interrupted / short downloads, validate Content-Range and safely resume partially downloaded large files.
-- Retry transient connection failures, 429 rate limits, 5xx responses, and stalled transfers with backoff.
-- Refresh expired Google OAuth access tokens, and retry MD5 mismatches once from a clean file.
-- Restore the Retry failed / Resume controls; show actual transfer error messages in the UI.
-- Safely skip completed Google Workspace exports using SHA-256 receipts stored in a hidden .north-drive-state directory.
-- Retry transient folder scans and identify Google Workspace modifications with modifiedTime.
-- Maintain compatible .northpart metadata for resumable files downloaded in v0.1.2.
-- Run cargo test and node --check in CI before packaging.
+1. Enable the **Google Drive API** in a Google Cloud project and create a Google API key.
+2. In the app, open **Settings**, enter the API key, and save. This is **not a Google account login**. Google's official `files.list` API requires an API key to enumerate publicly shared folders.
+3. In Google Drive, set the folder access to **Anyone with the link** and ensure downloads are allowed.
+4. Paste the folder URL, choose a Mac destination folder, and select **Analyze folder → Start**.
+5. If a file fails, view its error under **Downloads → Issues**. Choose **Retry failed** to continue a resumable file rather than downloading the same bytes again. Use the same destination after restarting the app.
 
-## Download and recovery
+**Private or organization-restricted folders are intentionally not supported.** The app does not provide a workaround for owners' download restrictions or API quota limits.
 
-Open GitHub Actions → Build macOS Universal DMG → latest successful main run → download artifact.
-Unzip the GitHub artifact and install North Drive Downloader.app from the DMG.
-If a file failed, keep the existing .northpart files; re-analyze the same folder, use the same destination and click Retry failed / Resume.
-Workspace exports do not support byte-range resume and start over if interrupted. For restricted links connect your authorized Google account.
-For large files on unstable networks start with 2 parallel downloads.
+## Reliability features
 
-## Validation / limits
+- Streaming downloads with checked HTTP content lengths, byte-range validation, partial-file resume and safe restarts if a server ignores Range.
+- Network backoff, retry for transient Google Drive rate limits/server errors and one clean retry on MD5 mismatch.
+- Preservation of unfinished `.northpart` files and metadata across restarts. Completed Google Workspace exports have SHA-256 receipts in the hidden `.north-drive-state` folder; incomplete exports must restart.
+- Transfer cancellation and pauses, failed-file retry, real error detail in Issues.
+- Default **2 parallel transfers** to reduce throttling on unstable connections. Adjustable from 1 to 8 in Settings.
+- Handles resource-key links, nested folders, duplicate filenames, and files with download restrictions (the latter are skipped with a warning).
 
-CI covers Rust unit tests, JavaScript syntax, the macOS app build, and DMG contents.
-Real Google Drive API transfer testing against the failing folder and macOS version remains necessary before claiming fully production-proven stability.
-Google Drive owner permissions, account quotas, 403 download restrictions, lack of disk space, and interrupted internet cannot be bypassed by the client.
-The DMG is ad-hoc signed, not Apple notarized; do not disable Gatekeeper globally.
+## macOS DMG
 
----
+Go to **Actions → Build macOS Universal DMG** in this repository, open a **successful run for the desired commit**, and download the **NorthDriveDownloader-macOS-Universal-DMG** artifact. Unzip it and open the DMG to install the app.
 
-This is the **source project** for the dark/pink macOS Google Drive downloader. It is not a precompiled or validated installer. The included build pipeline targets a real **universal macOS `.dmg`** that opens with a `North Drive Downloader.app` icon and `Applications` folder shortcut.
-
-## Get the DMG using a hosted Mac (no local compilation needed)
-
-1. Create a GitHub repository, upload/commit the files in this project **including `.github/workflows/build-macos-dmg.yml`**. To retain this hidden folder, use Git, not a web upload that omits hidden directories.
-2. Open your repository's **Actions** tab → **Build macOS Universal DMG** → **Run workflow**.
-3. Once the workflow finishes successfully, download the **NorthDriveDownloader-macOS-Universal-DMG** artifact. Unzip that GitHub artifact to obtain `NorthDriveDownloader-1.0.0-universal-adhoc.dmg`.
-4. Open the DMG, drag **North Drive Downloader.app** onto **Applications**, then eject the DMG.
-
-The workflow runs on GitHub's macOS runner and **has not been run or verified yet**. If the application fails to compile, the workflow will fail rather than upload a fake installer.
-
-## Build locally on your Mac
-
-Install Node.js 22+, stable Rust with `rustup`, and Xcode Command Line Tools. Then open Terminal in this folder and run:
+To build on macOS (Node.js 22+, stable Rust, Xcode Command Line Tools):
 
 ```sh
 zsh scripts/build-dmg.command
 ```
 
-This builds an Apple Silicon + Intel universal app and uses Tauri to create the drag-and-drop disk image. The output is under `dist/`. The `scripts/build-mac.command` shortcut runs the same builder. This is a normal `.dmg`, **not a `.pkg` installer**.
+The DMG contains `North Drive Downloader.app` and an Applications shortcut. It is **ad-hoc signed, not Apple-notarized**. Use the standard macOS Open Anyway option only if you trust the source and build; do not disable Gatekeeper globally.
 
-## Status and setup
+## QA and limitations
 
-- The dark-pink UI and HTML browser preview are included at `NorthDrive_UI_Preview.html`. The preview is simulated, not a working downloader.
-- The Rust backend includes source implementations of Drive folder enumeration, public API key access, private OAuth read-only access, streaming downloads, range-based partial-file resume, and checksum verification.
-- **This backend has not been compiled/tested on macOS or verified against Google Drive in this session.** Treat as developer-preview code, not a reliable production release.
-- Live use requires a Google Cloud project with **Google Drive API enabled**, an API key for public folders, and a Desktop OAuth Client ID for restricted folders, configured in Settings. Sign in with a Google account authorized to access the link.
-- The GitHub DMG is **ad-hoc signed** and **not notarized**, so macOS Gatekeeper may block the first launch. A normal public release needs Apple Developer ID signing and notarization. Never disable system security globally to open an unknown app.
-- Universal binary support depends on successful builds for both `aarch64-apple-darwin` and `x86_64-apple-darwin` targets.
+GitHub Actions runs `node --check ui/app.js`, Rust regression tests, a native universal macOS build, and a DMG-content check. These checks cannot prove that every Google Drive folder or connection will work: **real-world downloads with the affected public folder are still needed**. Do not claim zero bugs or 100% download success until that testing is done.
 
-## Installed app folder
+If an older version stored OAuth data in macOS Keychain, this version does not read or use it. Previously saved API keys remain in the local app preferences so upgrading doesn't require re-entering the key.
 
-The disk image must contain:
-
-```
-North Drive Downloader.app   → compiled native app
-Applications                 → link to your /Applications folder
-```
-
-The script verifies these entries and refuses to ship the image if they're missing.
-
-## Limitations
-
-Only one connected Google account, no persistent queue history, and downloads start after scanning finishes. Google Drive API quota/permissions, storage, and network limits still apply. Testing against non-sensitive Google Drive folders is recommended before using important client files.
+The Google Drive API key should be restricted to the Google Drive API in Google Cloud and kept private; never commit it to the repository.
