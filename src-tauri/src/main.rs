@@ -20,7 +20,7 @@ struct Preferences {
 }
 impl Default for Preferences {
     fn default() -> Self {
-        Self { api_key: String::new(), save_directory: String::new(), max_parallel: 4 }
+        Self { api_key: String::new(), save_directory: String::new(), max_parallel: 2 }
     }
 }
 
