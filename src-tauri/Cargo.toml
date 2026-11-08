@@ -1,8 +1,8 @@
 [package]
 name = "north-drive-downloader"
-version = "0.1.2"
+version = "0.2.0"
 description = "Direct Google Drive folder downloader for macOS"
-authors = ["North Drive"]
+authors = ["Muhaimenun Amin Rafi"]
 edition = "2021"
 
 [build-dependencies]
