@@ -49,3 +49,10 @@ jobs:
           name: NorthDriveDownloader-macOS-Universal-DMG
           path: dist/*.dmg
           if-no-files-found: error
+      - name: Upload verified app ZIP fallback
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: NorthDriveDownloader-macOS-Universal-App-ZIP
+          path: dist/*-app.zip
+          if-no-files-found: warn
