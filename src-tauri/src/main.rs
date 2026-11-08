@@ -343,10 +343,14 @@ async fn json_request<T: for<'de> Deserialize<'de>>(client: &Client, access: &Ac
             let header_value = keys.iter().map(|(k,v)| format!("{k}/{v}")).collect::<Vec<_>>().join(",");
             req = req.header("X-Goog-Drive-Resource-Keys", header_value);
         }
-        let response = match req.send().await {
-            Ok(value) => value,
-            Err(e) if attempt < 7 => { sleep(Duration::from_secs((1u64 << attempt.min(5)).min(32))).await; let _ = e; continue; },
-            Err(e) => return Err(e.to_string())
+        let response = match tokio::time::timeout(Duration::from_secs(90), req.send()).await {
+            Ok(Ok(value)) => value,
+            Ok(Err(_)) | Err(_) if attempt < 7 => {
+                sleep(Duration::from_secs((1u64 << attempt.min(5)).min(32))).await;
+                continue;
+            },
+            Ok(Err(e)) => return Err(e.to_string()),
+            Err(_) => return Err("Google Drive request timed out".into())
         };
         if response.status().is_success() {
             return response.json::<T>().await.map_err(|e| format!("Unexpected Google Drive response: {e}"));
@@ -630,7 +634,9 @@ async fn download_attempt(app: &AppHandle, client: &Client, prefs: &Preferences,
     else { req = req.query(&[("alt","media"), ("supportsAllDrives", "true")]); }
     if let Some(key) = &file.resource_key { req = req.header("X-Goog-Drive-Resource-Keys",format!("{}/{}",file.id,key)); }
     if offset > 0 { req = req.header(header::RANGE, format!("bytes={offset}-")); }
-    let mut response = req.send().await.map_err(|e| format!("RETRY: Network error: {e}"))?;
+    let mut response = tokio::time::timeout(Duration::from_secs(90),req.send()).await
+        .map_err(|_| "RETRY: Timed out waiting for Google Drive response".to_string())?
+        .map_err(|e|format!("RETRY: Network error: {e}"))?;
     if response.status() == StatusCode::UNAUTHORIZED && matches!(auth, Access::OAuth(_)) {
         expire_access(auth_cache).await;
         return Err("RETRY: Google OAuth token expired; refreshing".into());
