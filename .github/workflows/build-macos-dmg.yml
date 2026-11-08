@@ -37,6 +37,8 @@ jobs:
         run: npx tauri icon assets/icon.svg
       - name: Validate frontend syntax
         run: node --check ui/app.js
+      - name: Test blocked-download recovery UI
+        run: node --test scripts/test-recovery.cjs
       - name: Run Rust transfer regression tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
       - name: Build and verify drag-and-drop DMG

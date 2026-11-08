@@ -65,10 +65,21 @@ struct FileProgress {
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct RunSummary { completed: usize, failed: usize, cancelled: bool, errors: Vec<String> }
+struct RunSummary { completed: usize, failed: usize, cancelled: bool, blocked: bool, errors: Vec<String> }
 
 #[derive(Default)]
-struct RunControl { paused: AtomicBool, cancelled: AtomicBool }
+struct RunControl { paused: AtomicBool, cancelled: AtomicBool, blocked: AtomicBool }
+
+const GOOGLE_BLOCK_MESSAGE: &str = "Google returned a blocking page (HTTP 403). The queue is stopped and partial files are preserved. Try downloading the affected file directly from drive.google.com in your browser to see Google's full message. Once access works again, choose Resume in this app with the same destination. The app cannot clear Google's block.";
+
+// A web block is distinct from a JSON API permission or quota error.
+fn is_google_block_page(status: StatusCode, body: &str) -> bool {
+    if status != StatusCode::FORBIDDEN { return false; }
+    let body = body.trim_start().to_ascii_lowercase();
+    (body.starts_with("<!doctype html") || body.starts_with("<html"))
+        && (body.contains("<title>sorry") || body.contains("unusual traffic")
+            || body.contains("automated queries") || body.contains("google.com/sorry"))
+}
 struct AppState { prefs: Mutex<Preferences>, run: Mutex<Option<Arc<RunControl>>>, client: Client }
 
 #[derive(Debug, Deserialize)]
@@ -172,6 +183,7 @@ async fn json_request<T: for<'de> Deserialize<'de>>(client: &Client, access: &Ac
                 let retry_after = response.headers().get(header::RETRY_AFTER)
                     .and_then(|h| h.to_str().ok()).and_then(|s| s.parse::<u64>().ok());
                 let detail = response.text().await.unwrap_or_default();
+                if is_google_block_page(status, &detail) { return Err(GOOGLE_BLOCK_MESSAGE.into()); }
                 let retryable = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
                     || (status == StatusCode::FORBIDDEN && (detail.contains("rateLimitExceeded") || detail.contains("userRateLimitExceeded")));
                 if !retryable || attempt == 6 {
@@ -204,7 +216,7 @@ async fn resolve_access(client: &Client, prefs: &Preferences, id: &str, rk: &Opt
     if let Some(k) = rk { keys.insert(id.to_string(), k.clone()); }
     let access = Access { api_key: api_key.to_string() };
     let meta = metadata(client, &access, id, &keys).await.map_err(|error| {
-        if error.contains("HTTP 401") || error.contains("HTTP 403") || error.contains("HTTP 404") {
+        if error != GOOGLE_BLOCK_MESSAGE && (error.contains("HTTP 401") || error.contains("HTTP 403") || error.contains("HTTP 404")) {
             format!("This folder cannot be accessed publicly. Set Google Drive sharing to 'Anyone with the link' and verify your API key. Details: {error}")
         } else { error }
     })?;
@@ -322,8 +334,28 @@ fn part_paths(destination: &Path) -> (PathBuf, PathBuf) {
 async fn wait_for_run(control: &RunControl) -> Result<(), String> {
     loop {
         if control.cancelled.load(Ordering::SeqCst) { return Err("Cancelled".into()); }
+        if control.blocked.load(Ordering::SeqCst) { return Err(GOOGLE_BLOCK_MESSAGE.into()); }
         if !control.paused.load(Ordering::SeqCst) { return Ok(()); }
         sleep(Duration::from_millis(200)).await;
+    }
+}
+
+// Cancel/stop in-flight HTTP waits promptly instead of waiting for a stalled socket.
+async fn transfer_io<T>(
+    control: &RunControl,
+    future: impl std::future::Future<Output = Result<T, reqwest::Error>>,
+) -> Result<T, String> {
+    let pending = tokio::time::timeout(Duration::from_secs(120), future);
+    tokio::pin!(pending);
+    loop {
+        if control.cancelled.load(Ordering::SeqCst) { return Err("Cancelled".into()); }
+        if control.blocked.load(Ordering::SeqCst) { return Err(GOOGLE_BLOCK_MESSAGE.into()); }
+        tokio::select! {
+            result = &mut pending => return result
+                .map_err(|_| "Network stalled for 120 seconds; resuming transfer".to_string())?
+                .map_err(|e| format!("Transfer interrupted: {e}")),
+            _ = sleep(Duration::from_millis(200)) => {}
+        }
     }
 }
 
@@ -432,6 +464,7 @@ async fn record_export_completion(root: &Path, file: &DownloadItem, target: &Pat
 }
 
 async fn download_one(app: &AppHandle, client: &Client, access: &Access, file: &DownloadItem, root: &Path, control: &RunControl) -> Result<(), String> {
+    wait_for_run(control).await?;
     let relative = safe_relative(&file.relative_path)?;
     let target = root.join(relative);
     if let Some(parent) = target.parent() { async_fs::create_dir_all(parent).await.map_err(|e| e.to_string())?; }
@@ -484,6 +517,7 @@ async fn download_one(app: &AppHandle, client: &Client, access: &Access, file: &
             Ok(()) => break,
             Err(e) => {
                 if control.cancelled.load(Ordering::SeqCst) { return Err("Cancelled".into()); }
+                if control.blocked.load(Ordering::SeqCst) { return Err(GOOGLE_BLOCK_MESSAGE.into()); }
                 if attempt >= 8 || !retryable_transfer_error(&e) {
                     return Err(format!("{e} (attempt {attempt}/8; partial download preserved)"));
                 }
@@ -509,6 +543,7 @@ async fn download_one(app: &AppHandle, client: &Client, access: &Access, file: &
 }
 
 async fn download_attempt(app: &AppHandle, client: &Client, access: &Access, file: &DownloadItem, path: &Path, control: &RunControl) -> Result<(), String> {
+    wait_for_run(control).await?;
     let mut offset = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     // Google Workspace exports do not support byte ranges; partial exports must restart.
     if file.export_mime.is_some() && offset > 0 {
@@ -528,10 +563,14 @@ async fn download_attempt(app: &AppHandle, client: &Client, access: &Access, fil
     else { req = req.query(&[("alt", "media"), ("supportsAllDrives", "true")]); }
     if let Some(key) = &file.resource_key { req = req.header("X-Goog-Drive-Resource-Keys", format!("{}/{}", file.id, key)); }
     if offset > 0 { req = req.header(header::RANGE, format!("bytes={offset}-")); }
-    let mut response = req.send().await.map_err(|e| format!("Network error starting transfer: {e}"))?;
+    let mut response = transfer_io(control, req.send()).await?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = transfer_io(control, response.text()).await?;
+        if is_google_block_page(status, &body) {
+            control.blocked.store(true, Ordering::SeqCst);
+            return Err(GOOGLE_BLOCK_MESSAGE.into());
+        }
         return Err(format!("Google Drive HTTP {}: {}", status.as_u16(), body.chars().take(400).collect::<String>()));
     }
     let restart = validate_resume_response(
@@ -549,9 +588,8 @@ async fn download_attempt(app: &AppHandle, client: &Client, access: &Access, fil
     let mut last_update = Instant::now();
     progress(app, file, bytes, "downloading", 0.0, None);
     loop {
-        let chunk = tokio::time::timeout(Duration::from_secs(120), response.chunk()).await
-            .map_err(|_| "Network stalled for 120 seconds; resuming transfer".to_string())?
-            .map_err(|e| format!("Transfer interrupted: {e}"))?;
+        wait_for_run(control).await?;
+        let chunk = transfer_io(control, response.chunk()).await?;
         let Some(chunk) = chunk else { break; };
         wait_for_run(control).await?;
         f.write_all(&chunk).await.map_err(|e| format!("Cannot write downloaded file (check disk space): {e}"))?;
@@ -603,7 +641,7 @@ async fn start_download(app: AppHandle, state: State<'_, Arc<AppState>>, plan: F
 async fn download_folder(app: &AppHandle, client: &Client, prefs: &Preferences, plan: &FolderPlan, destination: &Path, run: &Arc<RunControl>) -> RunSummary {
     let root = destination.join(sanitized_name(&plan.folder_name));
     let mut errors = vec![];
-    if let Err(e) = async_fs::create_dir_all(&root).await { return RunSummary { completed:0, failed:plan.files.len(), cancelled:false, errors:vec![e.to_string()] }; }
+    if let Err(e) = async_fs::create_dir_all(&root).await { return RunSummary { completed:0, failed:plan.files.len(), cancelled:false, blocked:false, errors:vec![e.to_string()] }; }
     for name in &plan.empty_folders {
         match safe_relative(name) {
             Ok(p) => { if let Err(e)=async_fs::create_dir_all(root.join(p)).await { errors.push(e.to_string()); } }
@@ -616,12 +654,14 @@ async fn download_folder(app: &AppHandle, client: &Client, prefs: &Preferences, 
     let max_parallel = prefs.max_parallel.clamp(1,8);
     // Bound both active transfers AND completed-task bookkeeping.
     for file in plan.files.clone() {
-        if run.cancelled.load(Ordering::SeqCst) { break; }
+        if wait_for_run(run).await.is_err() { break; }
         while tasks.len() >= max_parallel {
             if let Some(joined) = tasks.join_next().await {
                 match joined { Ok(Ok(()))=>completed+=1, Ok(Err(e))=>{failed+=1;errors.push(e)}, Err(e)=>{failed+=1;errors.push(e.to_string())} }
             }
         }
+        // A worker may have blocked the run while the scheduler awaited a slot.
+        if wait_for_run(run).await.is_err() { break; }
         let app = app.clone(); let root = root.clone(); let client = client.clone(); let access = access.clone();
         let control = run.clone();
         tasks.spawn(async move {
@@ -631,7 +671,8 @@ async fn download_folder(app: &AppHandle, client: &Client, prefs: &Preferences, 
                     .map(|p| part_paths(&root.join(p)).0)
                     .and_then(|p| fs::metadata(p).ok())
                     .map(|m| m.len()).unwrap_or(0);
-                progress(&app, &file, partial_bytes, "failed", 0.0, Some(e.clone()));
+                let status = if e == GOOGLE_BLOCK_MESSAGE { "blocked" } else { "failed" };
+                progress(&app, &file, partial_bytes, status, 0.0, Some(e.clone()));
             }
             result.map_err(|e| format!("{}: {}", file.relative_path, e))
         });
@@ -639,7 +680,7 @@ async fn download_folder(app: &AppHandle, client: &Client, prefs: &Preferences, 
     while let Some(joined) = tasks.join_next().await {
         match joined { Ok(Ok(())) => completed+=1, Ok(Err(e)) => {failed+=1;errors.push(e)}, Err(e)=>{failed+=1;errors.push(e.to_string())} }
     }
-    RunSummary {completed,failed,cancelled:run.cancelled.load(Ordering::SeqCst),errors}
+    RunSummary {completed,failed,cancelled:run.cancelled.load(Ordering::SeqCst),blocked:run.blocked.load(Ordering::SeqCst),errors}
 }
 #[tauri::command]
 fn pause_download(state: State<'_, Arc<AppState>>, paused: bool) -> Result<(), String> {
@@ -669,6 +710,53 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test] fn google_block_pages_are_distinct_from_api_errors() {
+        let html = "<html><head><meta charset='utf-8'/><title>Sorry...</title></head></html>";
+        assert!(is_google_block_page(StatusCode::FORBIDDEN, html));
+        assert!(is_google_block_page(StatusCode::FORBIDDEN, "  <!DOCTYPE html><html>Unusual traffic</html>"));
+        assert!(!is_google_block_page(StatusCode::OK, html));
+        assert!(!is_google_block_page(StatusCode::FORBIDDEN, r#"{"error":{"message":"insufficientFilePermissions"}}"#));
+        assert!(!is_google_block_page(StatusCode::FORBIDDEN, r#"{"error":{"message":"userRateLimitExceeded"}}"#));
+        assert!(!retryable_transfer_error(GOOGLE_BLOCK_MESSAGE));
+    }
+
+    #[tokio::test] async fn blocked_queue_stops_waiters_and_new_attempts() {
+        let control = RunControl::default();
+        control.paused.store(true, Ordering::SeqCst);
+        control.blocked.store(true, Ordering::SeqCst);
+        let result = tokio::time::timeout(Duration::from_secs(1), wait_for_run(&control)).await.unwrap();
+        assert_eq!(result.unwrap_err(), GOOGLE_BLOCK_MESSAGE);
+        let result = transfer_io(&control, std::future::pending::<Result<(), reqwest::Error>>()).await;
+        assert_eq!(result.unwrap_err(), GOOGLE_BLOCK_MESSAGE);
+        // A fresh run allows explicit user resume; the old blocked run cannot send more requests.
+        assert!(wait_for_run(&RunControl::default()).await.is_ok());
+    }
+
+    #[tokio::test] async fn stop_interrupts_pending_network_io() {
+        let control = RunControl::default();
+        let pending = transfer_io(&control, std::future::pending::<Result<(), reqwest::Error>>());
+        let cancel = async {
+            sleep(Duration::from_millis(20)).await;
+            control.cancelled.store(true, Ordering::SeqCst);
+        };
+        let (result, _) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(pending, cancel)
+        }).await.unwrap();
+        assert_eq!(result.unwrap_err(), "Cancelled");
+    }
+
+    #[tokio::test] async fn block_interrupts_other_workers_network_io() {
+        let control = RunControl::default();
+        let pending = transfer_io(&control, std::future::pending::<Result<(), reqwest::Error>>());
+        let block = async {
+            sleep(Duration::from_millis(20)).await;
+            control.blocked.store(true, Ordering::SeqCst);
+        };
+        let (result, _) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(pending, block)
+        }).await.unwrap();
+        assert_eq!(result.unwrap_err(), GOOGLE_BLOCK_MESSAGE);
+    }
     #[test] fn parse_folder_and_key() {
         let (id,k)=parse_drive_link("https://drive.google.com/drive/u/0/folders/1aBcD_efGh1234?resourcekey=0-secret").unwrap();
         assert_eq!(id,"1aBcD_efGh1234"); assert_eq!(k.as_deref(),Some("0-secret"));
@@ -713,3 +801,4 @@ mod tests {
         assert!(!retryable_transfer_error("Google Drive HTTP 404: not found"));
     }
 }
+
