@@ -628,7 +628,8 @@ async fn download_attempt(app: &AppHandle, client: &Client, prefs: &Preferences,
     let endpoint = if file.export_mime.is_some() {
         format!("{DRIVE_BASE}/{}/export", file.id)
     } else { format!("{DRIVE_BASE}/{}", file.id) };
-    let auth = current_access(auth_cache, client, prefs).await?;
+    let auth = current_access(auth_cache, client, prefs).await
+        .map_err(|e|format!("PERMANENT: {e}"))?;
     let mut req = auth.request(client, &endpoint);
     if let Some(mime) = &file.export_mime { req = req.query(&[("mimeType",mime.as_str())]); }
     else { req = req.query(&[("alt","media"), ("supportsAllDrives", "true")]); }
@@ -664,7 +665,8 @@ async fn download_attempt(app: &AppHandle, client: &Client, prefs: &Preferences,
         .is_some_and(|v|v.to_ascii_lowercase().contains("text/html")) {
         return Err("RETRY: Google sent an HTML page instead of file data".into());
     }
-    let mut f = async_fs::OpenOptions::new().create(true).append(true).open(path).await.map_err(|e| e.to_string())?;
+    let mut f = async_fs::OpenOptions::new().create(true).append(true).open(path).await
+        .map_err(|e|format!("PERMANENT: Cannot open destination partial: {e}"))?;
     let started = Instant::now();
     let mut bytes = offset;
     let mut last_update = Instant::now();
