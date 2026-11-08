@@ -192,12 +192,17 @@ fn has_login() -> bool { keychain_entry().and_then(|e| e.get_password().map_err(
 #[tauri::command]
 fn get_preferences(state: State<'_, Arc<AppState>>) -> Preferences { state.prefs.lock().unwrap().clone() }
 #[tauri::command]
-fn is_connected() -> bool { has_login() }
+fn is_connected(state: State<'_, Arc<AppState>>) -> bool { has_login() && !state.prefs.lock().unwrap().client_id.is_empty() }
 #[tauri::command]
 fn set_preferences(app: AppHandle, state: State<'_, Arc<AppState>>, preferences: Preferences) -> Result<(), String> {
     if preferences.max_parallel == 0 || preferences.max_parallel > 8 { return Err("Parallel downloads must be between 1 and 8".into()); }
     let preferences = Preferences { api_key: preferences.api_key.trim().to_string(), client_id: preferences.client_id.trim().to_string(), save_directory: preferences.save_directory.trim().to_string(), max_parallel: preferences.max_parallel };
     persist_prefs(&app, &preferences)?;
+    let previous_client = state.prefs.lock().unwrap().client_id.clone();
+    if previous_client != preferences.client_id {
+        // Authorization belongs to a particular user-provided OAuth client ID.
+        if let Ok(entry) = keychain_entry() { let _ = entry.delete_credential(); }
+    }
     *state.prefs.lock().unwrap() = preferences;
     Ok(())
 }
@@ -763,6 +768,13 @@ async fn download_folder(app: &AppHandle, client: &Client, prefs: &Preferences, 
     RunSummary {completed,failed,cancelled:run.cancelled.load(Ordering::SeqCst),errors}
 }
 #[tauri::command]
+fn forget_session(app: AppHandle) -> Result<(), String> {
+    let path = session_file(&app)?;
+    if path.exists() { fs::remove_file(path).map_err(|e| e.to_string())?; }
+    Ok(())
+}
+
+#[tauri::command]
 fn open_developer_profile() -> Result<(), String> {
     Command::new("open").arg("https://www.instagram.com/muhaimenun.rafi/")
         .spawn().map_err(|e|format!("Cannot open Instagram: {e}"))?;
@@ -789,7 +801,7 @@ fn main() {
             app.manage(Arc::new(AppState { prefs: Mutex::new(prefs), run: Mutex::new(None), client }));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_preferences, set_preferences, is_connected, connect_google, disconnect, scan_folder, start_download, recover_session, open_developer_profile, pause_download, cancel_download])
+        .invoke_handler(tauri::generate_handler![get_preferences, set_preferences, is_connected, connect_google, disconnect, scan_folder, start_download, recover_session, forget_session, open_developer_profile, pause_download, cancel_download])
         .run(tauri::generate_context!())
         .expect("Failed to start North Drive Downloader");
 }
