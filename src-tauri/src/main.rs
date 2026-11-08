@@ -527,7 +527,7 @@ async fn retry_wait(control: &RunControl, seconds: u64) -> Result<(), String> {
     Ok(())
 }
 
-async fn download_one(app: &AppHandle, client: &Client, prefs: &Preferences, auth_cache: &AuthCache, file: &DownloadItem, root: &Path, control: &RunControl) -> Result<(), String> {
+async fn download_one(app: &AppHandle, client: &Client, prefs: &Preferences, auth_cache: &AuthCache, file: &DownloadItem, root: &Path, folder_key: Option<&str>, control: &RunControl) -> Result<(), String> {
     let relative = safe_relative(&file.relative_path)?;
     let target = root.join(relative);
     if let Some(parent) = target.parent() { async_fs::create_dir_all(parent).await.map_err(|e| e.to_string())?; }
@@ -560,7 +560,7 @@ async fn download_one(app: &AppHandle, client: &Client, prefs: &Preferences, aut
     let mut checksum_reset = false;
     loop {
         wait_for_run(control).await?;
-        let result = download_attempt(app, client, prefs, auth_cache, file, &part, control).await;
+        let result = download_attempt(app, client, prefs, auth_cache, file, &part, folder_key, control).await;
         match result {
             Ok(()) => {
                 let len = fs::metadata(&part).map_err(|e| e.to_string())?.len();
@@ -617,7 +617,7 @@ async fn download_one(app: &AppHandle, client: &Client, prefs: &Preferences, aut
     Ok(())
 }
 
-async fn download_attempt(app: &AppHandle, client: &Client, prefs: &Preferences, auth_cache: &AuthCache, file: &DownloadItem, path: &Path, control: &RunControl) -> Result<(), String> {
+async fn download_attempt(app: &AppHandle, client: &Client, prefs: &Preferences, auth_cache: &AuthCache, file: &DownloadItem, path: &Path, folder_key: Option<&str>, control: &RunControl) -> Result<(), String> {
     let mut offset = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     // Workspace exports cannot resume a range: restart the export without touching other files.
     if file.export_mime.is_some() && offset > 0 {
@@ -633,7 +633,10 @@ async fn download_attempt(app: &AppHandle, client: &Client, prefs: &Preferences,
     let mut req = auth.request(client, &endpoint);
     if let Some(mime) = &file.export_mime { req = req.query(&[("mimeType",mime.as_str())]); }
     else { req = req.query(&[("alt","media"), ("supportsAllDrives", "true")]); }
-    if let Some(key) = &file.resource_key { req = req.header("X-Goog-Drive-Resource-Keys",format!("{}/{}",file.id,key)); }
+    let mut resource_keys = Vec::new();
+    if let Some(root_key) = folder_key { resource_keys.push(root_key.to_string()); }
+    if let Some(key) = &file.resource_key { resource_keys.push(format!("{}/{}",file.id,key)); }
+    if !resource_keys.is_empty() { req = req.header("X-Goog-Drive-Resource-Keys",resource_keys.join(",")); }
     if offset > 0 { req = req.header(header::RANGE, format!("bytes={offset}-")); }
     let mut response = tokio::time::timeout(Duration::from_secs(90),req.send()).await
         .map_err(|_| "RETRY: Timed out waiting for Google Drive response".to_string())?
@@ -748,6 +751,7 @@ async fn download_folder(app: &AppHandle, client: &Client, prefs: &Preferences, 
     let mut tasks = tokio::task::JoinSet::new();
     let mut completed = 0; let mut failed = 0;
     let max_parallel = prefs.max_parallel.clamp(1,8);
+    let folder_key = plan.folder_resource_key.as_ref().map(|rk|format!("{}/{}",plan.folder_id,rk));
     // Bound both active transfers AND completed-task bookkeeping.
     for file in plan.files.clone() {
         if run.cancelled.load(Ordering::SeqCst) { break; }
@@ -757,9 +761,9 @@ async fn download_folder(app: &AppHandle, client: &Client, prefs: &Preferences, 
             }
         }
         let app = app.clone(); let root = root.clone(); let client = client.clone(); let prefs = prefs.clone(); let auth_cache = auth_cache.clone();
-        let control = run.clone();
+        let control = run.clone(); let folder_key = folder_key.clone();
         tasks.spawn(async move {
-            let result = download_one(&app, &client, &prefs, &auth_cache, &file, &root, &control).await;
+            let result = download_one(&app, &client, &prefs, &auth_cache, &file, &root, folder_key.as_deref(), &control).await;
             if let Err(ref e) = result {
                 let partial_bytes = safe_relative(&file.relative_path).ok()
                     .map(|p| part_paths(&root.join(p)).0)
