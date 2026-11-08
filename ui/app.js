@@ -87,7 +87,56 @@
   $('#clearViewBtn').addEventListener('click',()=>{if(state.running){toast('Finish or cancel the active download first',true);return;}state.plan=null;state.progress={};state.summary=null;render();toast('Local transfer view cleared. Downloaded files are untouched.')});
   let demoTimer;
   function startDemoProgress(){clearInterval(demoTimer);demoTimer=setInterval(()=>{if(!state.running){clearInterval(demoTimer);return}if(state.paused)return;let active=0;for(const f of state.plan.files){const d=state.progress[f.id];if(d.status==='completed')continue;if(active>=4)break;active++;d.status='downloading';const increment=Math.min(28*1048576,f.size-d.bytes);d.bytes+=increment;d.speed=increment*2;if(d.bytes>=f.size){d.status='completed';d.speed=0}}if(completedCount()===state.plan.files.length){state.running=false;state.summary={completed:completedCount(),failed:0,cancelled:false,errors:[]};toast('Demo download complete (no real files created)');clearInterval(demoTimer)}queueRender()},500)}
-  async function initialize(){if(tauri){try{state.preferences=await invoke('get_preferences');state.connected=await invoke('is_connected');window.__TAURI__.event.listen('north:progress',event=>{const p=event.payload;if(!p?.id)return;state.progress[p.id]={bytes:p.bytes??0,status:p.status,speed:p.speed??0,message:p.message};queueRender()});window.__TAURI__.event.listen('north:summary',event=>{state.summary=event.payload;state.running=false;state.paused=false;render();if(state.summary.cancelled)toast('Transfer cancelled. Partial files kept.');else if(state.summary.failed)toast(`${state.summary.failed} file(s) failed. Inspect Issues for details.`,true);else toast(`Downloaded ${state.summary.completed} files successfully!`)});}catch(e){toast(`App initialization issue: ${e}`,true)}}else{$('#previewBanner').style.display='block';$('#linkInput').value='https://drive.google.com/drive/folders/DEMO-FOLDER';state.plan=demoPlan();for(const f of state.plan.files) state.progress[f.id]={bytes:0,status:'queued',speed:0};state.progress[state.plan.files[0].id]={bytes:Math.floor(state.plan.files[0].size*.42),status:'downloading',speed:22*1048576};state.progress[state.plan.files[2].id]={bytes:state.plan.files[2].size,status:'completed',speed:0};state.progress[state.plan.files[1].id]={bytes:Math.floor(state.plan.files[1].size*.14),status:'downloading',speed:8*1048576};state.running=true;$('#savePath').value='/Users/you/Downloads/Client Projects';}
-    hydratePrefs();if(state.demo)$('#savePath').value='/Users/you/Downloads/Client Projects';updateAccount();render();setInterval(updateInsights,1500);}
+  async function initialize(){
+    let recovered=null;
+    if(tauri){
+      try{
+        state.preferences=await invoke('get_preferences');
+        state.connected=await invoke('is_connected');
+        await window.__TAURI__.event.listen('north:progress',event=>{
+          const p=event.payload;
+          if(!p?.id)return;
+          state.progress[p.id]={bytes:p.bytes??0,status:p.status,speed:p.speed??0,message:p.message};
+          queueRender();
+        });
+        await window.__TAURI__.event.listen('north:summary',event=>{
+          state.summary=event.payload;
+          state.running=false;
+          state.paused=false;
+          render();
+          if(state.summary.cancelled)toast('Transfer cancelled. Partial files kept.');
+          else if(state.summary.failed)toast(state.summary.failed+' file(s) need attention. Use Resume to retry.',true);
+          else toast('Downloaded '+state.summary.completed+' files successfully.');
+        });
+        recovered=await invoke('recover_session');
+        if(recovered?.plan){
+          state.plan=recovered.plan;
+          state.recovered=true;
+          state.progress={};
+          state.preferences.saveDirectory=recovered.directory;
+          for(const file of state.plan.files){
+            state.progress[file.id]={bytes:recovered.partialBytes?.[file.id]||0,status:'queued',speed:0};
+          }
+        }
+      }catch(e){toast('Initialization issue: '+String(e),true);}
+    }else{
+      $('#previewBanner').style.display='block';
+      $('#linkInput').value='https://drive.google.com/drive/folders/DEMO-FOLDER';
+      state.plan=demoPlan();
+      for(const file of state.plan.files)state.progress[file.id]={bytes:0,status:'queued',speed:0};
+      state.running=true;
+    }
+    hydratePrefs();
+    if(state.demo)$('#savePath').value='/Users/you/Downloads/Client Projects';
+    updateAuthorization();
+    renderWarnings();
+    render();
+    setInterval(updateInsights,1500);
+    if(recovered?.plan){
+      goPage('downloads');
+      if(recovered.autoResume){toast('Resuming interrupted transfer');await beginDownload();}
+      else toast('Previous transfer restored. Press Resume to continue.');
+    }
+  }
   initialize();
 })();
