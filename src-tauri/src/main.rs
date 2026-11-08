@@ -71,6 +71,23 @@ struct FileProgress {
 #[serde(rename_all = "camelCase")]
 struct RunSummary { completed: usize, failed: usize, cancelled: bool, errors: Vec<String> }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadSession {
+    plan: FolderPlan,
+    directory: String,
+    #[serde(default)]
+    auto_resume: bool,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryView {
+    plan: FolderPlan,
+    directory: String,
+    partial_bytes: HashMap<String, u64>,
+    auto_resume: bool,
+}
+
 #[derive(Default)]
 struct RunControl { paused: AtomicBool, cancelled: AtomicBool }
 struct AppState { prefs: Mutex<Preferences>, run: Mutex<Option<Arc<RunControl>>>, client: Client }
@@ -136,6 +153,36 @@ fn persist_prefs(app: &AppHandle, prefs: &Preferences) -> Result<(), String> {
 }
 fn read_prefs(app: &AppHandle) -> Preferences {
     config_file(app).ok().and_then(|p| fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+fn session_file(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(config_file(app)?.with_file_name("last-download.json"))
+}
+fn write_session(app: &AppHandle, session: &DownloadSession) -> Result<(), String> {
+    let path = session_file(app)?;
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, serde_json::to_vec_pretty(session).map_err(|e|e.to_string())?)
+        .map_err(|e|e.to_string())?;
+    fs::rename(temporary, path).map_err(|e|e.to_string())
+}
+#[tauri::command]
+fn recover_session(app: AppHandle) -> Result<Option<RecoveryView>, String> {
+    let path = session_file(&app)?;
+    if !path.exists() { return Ok(None); }
+    let session: DownloadSession = serde_json::from_slice(&fs::read(path).map_err(|e|e.to_string())?)
+        .map_err(|e|format!("Cannot restore previous download: {e}"))?;
+    if !Path::new(&session.directory).is_absolute() { return Err("Invalid saved destination".into()); }
+    let root = Path::new(&session.directory).join(sanitized_name(&session.plan.folder_name));
+    let mut partial_bytes = HashMap::new();
+    for item in &session.plan.files {
+        if let Ok(relative) = safe_relative(&item.relative_path) {
+            let destination = root.join(relative);
+            let part = part_paths(&destination).0;
+            let bytes = fs::metadata(&destination).or_else(|_| fs::metadata(&part))
+                .map(|m|m.len()).unwrap_or(0);
+            if bytes > 0 { partial_bytes.insert(item.id.clone(), bytes); }
+        }
+    }
+    Ok(Some(RecoveryView {plan:session.plan, directory:session.directory, partial_bytes, auto_resume:session.auto_resume}))
 }
 fn keychain_entry() -> Result<keyring::Entry, String> {
     keyring::Entry::new(KEYCHAIN_SERVICE, "refresh-token").map_err(|e| e.to_string())
@@ -222,7 +269,7 @@ async fn connect_google(state: State<'_, Arc<AppState>>) -> Result<String, Strin
 
 async fn refresh_access_token(client: &Client, prefs: &Preferences) -> Result<String, String> {
     if prefs.client_id.is_empty() { return Err("OAuth Client ID not configured".into()); }
-    let refresh = keychain_entry()?.get_password().map_err(|_| "Google account not connected. Go to Accounts and sign in".to_string())?;
+    let refresh = keychain_entry()?.get_password().map_err(|_| "Private folder needs authorization in Settings".to_string())?;
     let response = client.post("https://oauth2.googleapis.com/token").form(&[
         ("client_id", prefs.client_id.as_str()), ("refresh_token", refresh.as_str()), ("grant_type", "refresh_token")
     ]).send().await.map_err(|e| e.to_string())?;
@@ -331,7 +378,7 @@ async fn resolve_access(client: &Client, prefs: &Preferences, id: &str, rk: &Opt
         return Ok((oauth, meta));
     }
     Err(if prefs.api_key.is_empty() {
-        "Configure a Google Drive API key for public links, or connect your Google account for restricted links".into()
+        "Add your Google Drive API key in Settings; private folders also need an authorized OAuth Desktop Client ID".into()
     } else { format!("Public access failed: {public_err}. If this is restricted, connect an authorized Google account") })
 }
 fn workspace_export(mime: &str) -> Option<(&'static str, &'static str)> {
@@ -648,12 +695,24 @@ async fn start_download(app: AppHandle, state: State<'_, Arc<AppState>>, plan: F
     {
         let mut current = state.run.lock().unwrap();
         if current.is_some() { return Err("A download is already running. Finish cancelling before starting another".into()); }
+        // No credentials are stored in the resume record.
+        write_session(&app, &DownloadSession { plan: plan.clone(), directory: directory.trim().to_string(), auto_resume: true })?;
         *current = Some(run.clone());
     }
     let client = state.client.clone(); let app_handle = app.clone();
     let state_handle = state.inner().clone();
     tauri::async_runtime::spawn(async move {
         let result = download_folder(&app_handle, &client, &prefs, &plan, &destination, &run).await;
+        if !result.cancelled && result.failed == 0 {
+            if let Ok(path) = session_file(&app_handle) { let _ = fs::remove_file(path); }
+        } else if let Ok(path) = session_file(&app_handle) {
+            if let Ok(raw) = fs::read(&path) {
+                if let Ok(mut session) = serde_json::from_slice::<DownloadSession>(&raw) {
+                    session.auto_resume = false;
+                    let _ = write_session(&app_handle, &session);
+                }
+            }
+        }
         let _ = app_handle.emit("north:summary", result);
         let mut active = state_handle.run.lock().unwrap();
         if active.as_ref().is_some_and(|existing| Arc::ptr_eq(existing, &run)) { *active = None; }
@@ -704,6 +763,13 @@ async fn download_folder(app: &AppHandle, client: &Client, prefs: &Preferences, 
     RunSummary {completed,failed,cancelled:run.cancelled.load(Ordering::SeqCst),errors}
 }
 #[tauri::command]
+fn open_developer_profile() -> Result<(), String> {
+    Command::new("open").arg("https://www.instagram.com/muhaimenun.rafi/")
+        .spawn().map_err(|e|format!("Cannot open Instagram: {e}"))?;
+    Ok(())
+}
+
+#[tauri::command]
 fn pause_download(state: State<'_, Arc<AppState>>, paused: bool) -> Result<(), String> {
     let guard=state.run.lock().unwrap(); let run=guard.as_ref().ok_or("No active transfer")?;
     run.paused.store(paused, Ordering::SeqCst); Ok(())
@@ -719,11 +785,11 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let prefs = read_prefs(app.handle());
-            let client = Client::builder().connect_timeout(Duration::from_secs(25)).build()?;
+            let client = Client::builder().connect_timeout(Duration::from_secs(25)).pool_idle_timeout(Duration::from_secs(90)).build()?;
             app.manage(Arc::new(AppState { prefs: Mutex::new(prefs), run: Mutex::new(None), client }));
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_preferences, set_preferences, is_connected, connect_google, disconnect, scan_folder, start_download, pause_download, cancel_download])
+        .invoke_handler(tauri::generate_handler![get_preferences, set_preferences, is_connected, connect_google, disconnect, scan_folder, start_download, recover_session, open_developer_profile, pause_download, cancel_download])
         .run(tauri::generate_context!())
         .expect("Failed to start North Drive Downloader");
 }
