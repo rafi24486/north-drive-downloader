@@ -17,3 +17,35 @@
 .page-home .panel-glow{border-color:#8036619c;box-shadow:0 0 0 1px #f442900b,0 0 35px #df238c13,inset 0 0 40px #941a470a}
 .page-home .form-hint{margin-top:13px}
 @media(max-width:720px){.page-home .home-heading{padding-top:29px}.home-ready{display:none}.page-home .link-panel{padding:16px}}
+
+/* Minimal layout, readable errors, and genuinely resizable macOS window. */
+.shell{grid-template-columns:235px minmax(0,1fr) 278px}
+.main-pane{min-width:0}
+.link-options .destination{width:100%}
+.auth-actions{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:17px 0 6px}
+.auth-hint{color:#95869a;font-size:11px;line-height:1.5}
+.file-error{display:block;margin-top:5px;color:#fa86bf;font-size:10px;line-height:1.35;word-break:break-word;overflow:hidden;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2}
+.bottom-brand{margin-top:auto;padding:20px 0 3px;color:#928397;font-size:11px;letter-spacing:0}
+.bottom-brand a{color:#f987c8;font-weight:650;text-decoration:none}
+.bottom-brand a:hover{text-decoration:underline}
+@media(max-width:1190px){
+  .shell{grid-template-columns:212px minmax(0,1fr)}
+  .insights-pane{display:none}
+  .main-pane{padding-left:26px;padding-right:26px}
+}
+@media(max-width:900px){
+  .shell{grid-template-columns:170px minmax(0,1fr)}
+  .sidebar{padding-left:9px;padding-right:9px}
+  .nav-item{gap:9px;padding-left:10px}
+  .brand{padding:0 1px 45px;gap:6px}
+  .brand-title{font-size:20px}
+  .brand-subtitle{letter-spacing:1px;font-size:8px}
+  .main-pane{padding-left:17px;padding-right:17px}
+  .page-title-row{gap:15px;flex-wrap:wrap}
+  .files-toolbar{flex-wrap:wrap}
+  .files-head,.file-row{grid-template-columns:minmax(150px,2fr) 65px minmax(75px,1fr) 80px;gap:7px;padding-left:11px;padding-right:11px}
+  .file-row{min-width:0}
+  .url-row{gap:5px;padding-left:8px}
+  .url-row .btn-primary{padding:13px 9px}
+  .feature-strip{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
