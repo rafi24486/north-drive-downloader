@@ -804,4 +804,25 @@ mod tests {
     #[test] fn rejects_wrong_host() {assert!(parse_drive_link("https://evil.com/drive/folders/12345678").is_err());}
     #[test] fn rejects_path_traversal() { assert!(safe_relative("../footage.mov").is_err()); assert!(safe_relative("A/B.mov").is_ok()); }
     #[test] fn collision_names() {let mut seen=HashSet::new();assert_eq!(unique_name("A.mov",&mut seen),"A.mov");assert_eq!(unique_name("a.MOV",&mut seen),"a (2).MOV");}
+    #[test] fn drive_quota_is_retriable() {
+        let raw = r#"{"error":{"errors":[{"reason":"rateLimitExceeded"}],"message":"Rate Limit Exceeded"}}"#;
+        assert!(response_issue(StatusCode::FORBIDDEN,raw).starts_with("QUOTA: "));
+        assert!(response_issue(StatusCode::TOO_MANY_REQUESTS,raw).starts_with("RETRY: "));
+    }
+    #[test] fn drive_permissions_are_not_retried_forever() {
+        let raw = r#"{"error":{"errors":[{"reason":"insufficientFilePermissions"}],"message":"Forbidden"}}"#;
+        assert!(response_issue(StatusCode::FORBIDDEN,raw).starts_with("PERMANENT: "));
+    }
+    #[test] fn html_403_has_readable_message() {
+        let e = response_issue(StatusCode::FORBIDDEN,"<html><body>error</body></html>");
+        assert!(e.starts_with("QUOTA: "));
+        assert!(e.contains("HTML error page"));
+        assert!(!e.contains("<html>"));
+    }
+    #[test] fn partial_files_have_matching_sidecars() {
+        let path = Path::new("/tmp/Footage.MP4");
+        let (partial, sidecar) = part_paths(path);
+        assert_eq!(partial.file_name().unwrap().to_str().unwrap(), "Footage.MP4.northpart");
+        assert_eq!(sidecar.file_name().unwrap().to_str().unwrap(), "Footage.MP4.northpart.json");
+    }
 }
